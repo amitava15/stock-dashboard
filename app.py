@@ -160,6 +160,17 @@ def get_key_metrics(symbol):  return _first(f"key-metrics-ttm?symbol={symbol}")
 def get_profile(symbol):      return _first(f"profile?symbol={symbol}")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_companies(query: str):
+    """Look up tickers by company name (or partial name/ticker)."""
+    q = requests.utils.quote(query)
+    try:
+        data = fmp_get(f"search-name?query={q}")
+    except requests.HTTPError:
+        return []
+    return data if isinstance(data, list) else []
+
+
 # ---------------------------------------------------------------------------
 # Safe field access + formatting helpers
 # ---------------------------------------------------------------------------
@@ -401,7 +412,29 @@ def show_ticker(symbol):
 st.sidebar.title("📈 Stock Research")
 st.sidebar.caption("Aggregate the data. Understand the metrics. **You** decide.")
 
-ticker = st.sidebar.text_input("🔎 Analyze a ticker", placeholder="e.g. AAPL").strip()
+search_term = st.sidebar.text_input("🔎 Search company or ticker",
+                                     placeholder="e.g. Apple  or  AAPL").strip()
+
+selected_symbol = None
+if search_term:
+    matches = search_companies(search_term)
+    if matches:
+        options = {}
+        for m in matches[:10]:
+            sym = m.get("symbol")
+            if not sym:
+                continue
+            nm = m.get("name") or sym
+            exch = m.get("exchangeFullName") or m.get("exchange") or ""
+            label = f"{nm} ({sym})" + (f" · {exch}" if exch else "")
+            options[label] = sym
+        if options:
+            choice = st.sidebar.selectbox("Select a match:", list(options.keys()))
+            selected_symbol = options[choice]
+    if selected_symbol is None:
+        # No name matches — fall back to treating the input as a ticker.
+        selected_symbol = search_term.upper()
+        st.sidebar.caption(f"No name matches — trying **{selected_symbol}** as a ticker.")
 
 st.sidebar.markdown("---")
 preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"])
@@ -419,8 +452,8 @@ if not API_KEY:
     )
     st.stop()
 
-if ticker:
-    show_ticker(ticker)
+if selected_symbol:
+    show_ticker(selected_symbol)
 else:
     show_movers(preset_map[preset])
 
