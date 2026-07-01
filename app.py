@@ -21,6 +21,68 @@ import pandas as pd
 
 st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layout="wide")
 
+# ---------------------------------------------------------------------------
+# Styling: quiet editorial "tasting card" — serif values like menu prices,
+# letter-spaced labels like menu sections, hairline rules between courses.
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+:root{
+  --ink:#23231E; --paper:#FCFBF8; --muted:#7A7970; --line:#E8E6DE;
+  --pos:#2F6B4F; --neg:#A24A38;
+}
+
+.stApp, [data-testid="stAppViewContainer"]{ background:var(--paper); }
+[data-testid="stHeader"]{ background:transparent; }
+html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"]{
+  font-family:'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif; color:var(--ink);
+}
+.block-container{ max-width:1080px; padding-top:2.6rem; padding-bottom:4.5rem; }
+
+/* Page title — masthead */
+h1{ font-family:'Fraunces', Georgia, serif !important; font-weight:600 !important;
+    letter-spacing:-0.015em; font-size:2.4rem !important; color:var(--ink); }
+h3, h4{ font-family:'Fraunces', Georgia, serif !important; font-weight:500 !important;
+    letter-spacing:-0.01em; }
+
+/* Ticker symbol + company line */
+.rt-symbol{ font-family:'Fraunces', Georgia, serif; font-weight:600; font-size:2.15rem;
+    letter-spacing:-0.015em; line-height:1.1; margin:.2rem 0 .1rem; }
+.rt-company{ font-family:'Fraunces', Georgia, serif; font-style:italic; font-size:1.02rem;
+    color:var(--muted); margin:0 0 .2rem; }
+
+/* Section header — a "course" with a hairline rule and a plain-English kicker */
+.rt-section{ margin:2.1rem 0 1.1rem; padding-top:1.1rem; border-top:1px solid var(--line); }
+.rt-section .kicker{ font-size:.68rem; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--muted); }
+.rt-section h2{ font-family:'Fraunces', Georgia, serif; font-weight:500; font-size:1.3rem;
+    margin:.15rem 0 0; color:var(--ink); }
+
+/* Metric labels — small, letter-spaced, quiet (menu section labels) */
+[data-testid="stMetricLabel"] p, [data-testid="stMetricLabel"] div{
+    font-family:'IBM Plex Sans', sans-serif !important; font-size:.7rem !important;
+    letter-spacing:.11em; text-transform:uppercase; color:var(--muted) !important; font-weight:500; }
+
+/* Metric values — serif tabular figures (menu prices) */
+[data-testid="stMetricValue"]{
+    font-family:'Fraunces', Georgia, serif !important; font-weight:500 !important;
+    font-variant-numeric:tabular-nums; letter-spacing:-0.01em; color:var(--ink); }
+
+[data-testid="stMetricDelta"]{ font-family:'IBM Plex Sans', sans-serif !important; font-weight:500; }
+[data-testid="stMetricLabel"] svg{ opacity:.55; }
+
+/* Sidebar — soft, set apart with a hairline */
+[data-testid="stSidebar"]{ background:#F5F3EC; border-right:1px solid var(--line); }
+[data-testid="stSidebar"] h1{ font-family:'Fraunces', Georgia, serif !important;
+    font-size:1.2rem !important; font-weight:600 !important; }
+
+hr{ border-color:var(--line); }
+[data-testid="stCaptionContainer"]{ color:var(--muted); }
+</style>
+""", unsafe_allow_html=True)
+
 FMP_BASE = "https://financialmodelingprep.com/stable"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -301,13 +363,19 @@ def metric_tile(col, label, value, explainer_key, note=None):
         st.metric(label, value, help=help_text or None)
 
 
+def section(title, kicker=""):
+    """Render an editorial section header: hairline rule + kicker + serif title."""
+    kick = f'<div class="kicker">{kicker}</div>' if kicker else ""
+    st.markdown(f'<div class="rt-section">{kick}<h2>{title}</h2></div>', unsafe_allow_html=True)
+
+
 # ===========================================================================
 # Views
 # ===========================================================================
 def show_movers(kind):
-    titles = {"gainers": "📈 Top Gainers", "losers": "📉 Top Losers", "actives": "🔥 Most Active"}
-    st.subheader(titles.get(kind, "Movers"))
-    st.caption("Today's biggest moves. See one you want to understand? Search it in the sidebar to drill in.")
+    titles = {"gainers": "Top Gainers", "losers": "Top Losers", "actives": "Most Active"}
+    section(titles.get(kind, "Movers"), "today's biggest moves")
+    st.caption("See one you want to understand? Search it in the sidebar to drill in.")
 
     try:
         rows = get_movers(kind)
@@ -337,7 +405,7 @@ def show_movers(kind):
 
 def show_ticker(symbol):
     symbol = symbol.upper().strip()
-    st.subheader(f"🔎 {symbol}")
+    st.markdown(f'<div class="rt-symbol">{symbol}</div>', unsafe_allow_html=True)
 
     if not FINNHUB_KEY:
         st.info(
@@ -383,13 +451,13 @@ def show_ticker(symbol):
     header = name + (f"  ·  {industry}" if industry else "")
     if profile.get("exchange"):
         header += f"  ·  {profile['exchange']}"
-    st.markdown(f"**{header}**")
+    st.markdown(f'<div class="rt-company">{header}</div>', unsafe_allow_html=True)
 
     price = quote.get("price")
     change_pct = quote.get("change_pct")
 
     # ---- Snapshot ----
-    st.markdown("#### Snapshot")
+    section("Snapshot", "the essentials")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("Price", money(price),
@@ -408,14 +476,14 @@ def show_ticker(symbol):
     metric_tile(c4, "Avg Daily Volume", big_count(metrics.get("avg_volume")), "volume")
 
     # ---- Valuation ----
-    st.markdown("#### Valuation")
+    section("Valuation", "what it costs")
     c1, c2, c3 = st.columns(3)
     metric_tile(c1, "P/E (trailing)", num(metrics.get("pe")), "pe")
     metric_tile(c2, "PEG", num(metrics.get("peg")), "peg")
     metric_tile(c3, "EV / EBITDA", num(metrics.get("ev_ebitda")), "ev_ebitda")
 
     # ---- Financial health ----
-    st.markdown("#### Financial Health")
+    section("Financial Health", "how it's doing")
     c1, c2, c3, c4 = st.columns(4)
     metric_tile(c1, "Net Margin", pct(metrics.get("net_margin_pct")), "net_margin")
     metric_tile(c2, "Gross Margin", pct(metrics.get("gross_margin_pct")), "gross_margin")
@@ -423,7 +491,7 @@ def show_ticker(symbol):
     metric_tile(c4, "Return on Equity", pct(metrics.get("roe_pct")), "roe")
 
     # ---- Risk ----
-    st.markdown("#### Risk")
+    section("Risk", "what could move it")
     c1, c2, c3 = st.columns(3)
     metric_tile(c1, "Beta", num(metrics.get("beta")), "beta")
     with c2:
@@ -432,7 +500,7 @@ def show_ticker(symbol):
         st.metric("Prev Close", money(quote.get("prev_close")))
 
     # ---- Your notes ----
-    st.markdown("#### Your Notes")
+    section("Your Notes", "your call")
     st.caption("Write your own reasoning. (Session-only for now — permanent saving is a later feature.)")
     st.text_area("What's your read on this one?", key=f"notes_{symbol}", height=120,
                  placeholder="e.g. Strong margins but debt looks high for the sector — check latest earnings before deciding.")
@@ -443,7 +511,7 @@ def show_ticker(symbol):
 # ===========================================================================
 # Sidebar + routing
 # ===========================================================================
-st.sidebar.title("📈 Stock Research")
+st.sidebar.title("Stock Research")
 st.sidebar.caption("Aggregate the data. Understand the metrics. **You** decide.")
 
 search_term = st.sidebar.text_input("🔎 Search company or ticker",
