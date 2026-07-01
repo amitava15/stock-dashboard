@@ -1,6 +1,6 @@
 """
-Stock Research Dashboard  —  Layers 1 & 2
-------------------------------------------
+Stock Research Dashboard  —  Layers 1 & 2  (FMP "stable" API)
+------------------------------------------------------------
 Layer 1: A screen of top movers (gainers / losers / most active).
 Layer 2: Drill into any ticker and see its key metrics, each with a
          plain-English explainer so you learn what the number means.
@@ -21,17 +21,15 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layout="wide")
 
-BASE = "https://financialmodelingprep.com/api/v3"
+# NOTE: FMP retired the old /api/v3/ endpoints. New keys use the /stable/ API.
+BASE = "https://financialmodelingprep.com/stable"
 
 # Your FMP API key lives in Streamlit "secrets", never in this file.
-# Locally: create .streamlit/secrets.toml  with   FMP_API_KEY = "your_key"
-# On Streamlit Cloud: paste it under App settings -> Secrets.
 API_KEY = st.secrets.get("FMP_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
 # Plain-English explainers  —  this is the "understand finance" layer.
-# Each entry explains: what it measures, what's healthy, what high/low signals.
 # ---------------------------------------------------------------------------
 EXPLAINERS = {
     "market_cap": (
@@ -125,7 +123,7 @@ EXPLAINERS = {
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fmp_get(path: str):
-    """Call an FMP endpoint and return parsed JSON. Cached for 15 minutes."""
+    """Call an FMP /stable/ endpoint and return parsed JSON. Cached 15 min."""
     sep = "&" if "?" in path else "?"
     url = f"{BASE}/{path}{sep}apikey={API_KEY}"
     resp = requests.get(url, timeout=15)
@@ -133,14 +131,21 @@ def fmp_get(path: str):
     return resp.json()
 
 
+# Stable endpoint names for the movers presets
+MOVER_ENDPOINTS = {
+    "gainers": "biggest-gainers",
+    "losers": "biggest-losers",
+    "actives": "most-active",
+}
+
+
 def get_movers(kind: str):
-    """kind is 'gainers', 'losers', or 'actives'."""
-    data = fmp_get(f"stock_market/{kind}")
+    data = fmp_get(MOVER_ENDPOINTS[kind])
     return data if isinstance(data, list) else []
 
 
 def _first(path: str):
-    """Many FMP endpoints return a list with one object; grab it safely."""
+    """Most FMP endpoints return a list with one object; grab it safely."""
     data = fmp_get(path)
     if isinstance(data, list) and data:
         return data[0]
@@ -149,18 +154,29 @@ def _first(path: str):
     return {}
 
 
-def get_quote(symbol):        return _first(f"quote/{symbol}")
-def get_ratios(symbol):       return _first(f"ratios-ttm/{symbol}")
-def get_key_metrics(symbol):  return _first(f"key-metrics-ttm/{symbol}")
-def get_profile(symbol):      return _first(f"profile/{symbol}")
+def get_quote(symbol):        return _first(f"quote?symbol={symbol}")
+def get_ratios(symbol):       return _first(f"ratios-ttm?symbol={symbol}")
+def get_key_metrics(symbol):  return _first(f"key-metrics-ttm?symbol={symbol}")
+def get_profile(symbol):      return _first(f"profile?symbol={symbol}")
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers
+# Safe field access + formatting helpers
 # ---------------------------------------------------------------------------
+def pick(d, *keys):
+    """Return the first present, non-null value among candidate field names."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if d.get(k) is not None:
+            return d.get(k)
+    return None
+
+
 def to_float(v):
     try:
-        return float(str(v).replace("%", "").replace("(", "").replace(")", "").replace("+", "").replace(",", ""))
+        s = str(v).replace("%", "").replace("(", "").replace(")", "").replace("+", "").replace(",", "")
+        return float(s)
     except (TypeError, ValueError):
         return None
 
@@ -188,6 +204,16 @@ def num(v, decimals=2, suffix=""):
 def pct(v):
     v = to_float(v)
     return f"{v:,.2f}%" if v is not None else "N/A"
+
+
+def as_pct(v):
+    """Format a margin whether FMP returns a fraction (0.25) or a number (25)."""
+    v = to_float(v)
+    if v is None:
+        return "N/A"
+    if abs(v) <= 1.5:      # looks like a fraction -> convert to percent
+        v *= 100
+    return f"{v:,.2f}%"
 
 
 def big_count(v):
@@ -220,19 +246,29 @@ def show_movers(kind):
     st.subheader(titles.get(kind, "Movers"))
     st.caption("Today's biggest moves. See one you want to understand? Type its ticker in the sidebar to drill in.")
 
-    rows = get_movers(kind)
+    try:
+        rows = get_movers(kind)
+    except requests.HTTPError as e:
+        st.error(f"Couldn't load movers from the data provider. The API limit may be reached, or it's outside market hours. ({e})")
+        return
+
     if not rows:
         st.warning("No data came back. This can happen outside US market hours, or if the daily API limit was hit.")
         return
 
     df = pd.DataFrame(rows)
-    keep = [c for c in ["symbol", "name", "price", "changesPercentage"] if c in df.columns]
+    # Normalize the percent-change column name across API versions
+    for cand in ("changePercentage", "changesPercentage", "changesPercent"):
+        if cand in df.columns:
+            df = df.rename(columns={cand: "changePct"})
+            break
+    keep = [c for c in ["symbol", "name", "price", "changePct"] if c in df.columns]
     df = df[keep].head(15).copy()
-    if "changesPercentage" in df.columns:
-        df["changesPercentage"] = df["changesPercentage"].map(to_float)
+    if "changePct" in df.columns:
+        df["changePct"] = df["changePct"].map(to_float)
     df = df.rename(columns={
         "symbol": "Symbol", "name": "Company",
-        "price": "Price ($)", "changesPercentage": "Change %",
+        "price": "Price ($)", "changePct": "Change %",
     })
 
     st.dataframe(
@@ -258,28 +294,42 @@ def show_ticker(symbol):
         st.warning(f"No data found for '{symbol}'. Double-check the ticker symbol.")
         return
 
-    profile = get_profile(symbol)
-    ratios = get_ratios(symbol)
-    metrics = get_key_metrics(symbol)
+    # These are secondary; if any fail, keep going with what we have.
+    try:
+        profile = get_profile(symbol)
+    except requests.HTTPError:
+        profile = {}
+    try:
+        ratios = get_ratios(symbol)
+    except requests.HTTPError:
+        ratios = {}
+    try:
+        metrics = get_key_metrics(symbol)
+    except requests.HTTPError:
+        metrics = {}
 
-    name = profile.get("companyName") or quote.get("name") or symbol
-    sector = profile.get("sector")
-    industry = profile.get("industry")
+    name = pick(profile, "companyName") or pick(quote, "name") or symbol
+    sector = pick(profile, "sector")
+    industry = pick(profile, "industry")
     header = name
     if sector:
         header += f"  ·  {sector}" + (f" / {industry}" if industry else "")
     st.markdown(f"**{header}**")
 
+    price = pick(quote, "price")
+    change_pct = pick(quote, "changePercentage", "changesPercentage")
+
     # ---- Snapshot ----
     st.markdown("#### Snapshot")
     c1, c2, c3, c4 = st.columns(4)
-    price = quote.get("price")
-    change_pct = quote.get("changesPercentage")
     with c1:
-        st.metric("Price", money(price), delta=pct(change_pct) if to_float(change_pct) is not None else None)
-    metric_tile(c2, "Market Cap", big_money(quote.get("marketCap")), "market_cap")
+        st.metric("Price", money(price),
+                  delta=pct(change_pct) if to_float(change_pct) is not None else None)
+    metric_tile(c2, "Market Cap",
+                big_money(pick(quote, "marketCap") or pick(profile, "marketCap", "mktCap")),
+                "market_cap")
 
-    low, high = quote.get("yearLow"), quote.get("yearHigh")
+    low, high = pick(quote, "yearLow"), pick(quote, "yearHigh")
     range_val = f"{money(low)} – {money(high)}" if to_float(low) and to_float(high) else "N/A"
     range_note = None
     p, lo, hi = to_float(price), to_float(low), to_float(high)
@@ -288,34 +338,43 @@ def show_ticker(symbol):
         range_note = f"Today's price sits about {position:.0f}% of the way up its 52-week range."
     metric_tile(c3, "52-Week Range", range_val, "week_range", note=range_note)
 
-    vol, avg_vol = quote.get("volume"), quote.get("avgVolume")
+    vol = pick(quote, "volume")
+    avg_vol = pick(quote, "avgVolume", "averageVolume") or pick(profile, "averageVolume", "volAvg")
     vol_note = None
     v, av = to_float(vol), to_float(avg_vol)
     if v and av and av > 0:
         vol_note = f"Today's volume is about {v / av:.1f}× the average — {'unusually high' if v / av > 1.5 else 'roughly normal'}."
-    metric_tile(c4, "Volume (vs avg)", f"{big_count(vol)}  (avg {big_count(avg_vol)})", "volume", note=vol_note)
+    metric_tile(c4, "Volume (vs avg)",
+                f"{big_count(vol)}  (avg {big_count(avg_vol)})", "volume", note=vol_note)
 
     # ---- Valuation ----
     st.markdown("#### Valuation")
     c1, c2, c3 = st.columns(3)
-    metric_tile(c1, "P/E (trailing)", num(quote.get("pe")), "pe")
-    metric_tile(c2, "PEG", num(ratios.get("pegRatioTTM")), "peg")
-    metric_tile(c3, "EV / EBITDA", num(metrics.get("enterpriseValueOverEBITDATTM")), "ev_ebitda")
+    pe = pick(quote, "pe") or pick(ratios, "priceToEarningsRatioTTM", "peRatioTTM")
+    peg = pick(ratios, "pegRatioTTM", "priceEarningsToGrowthRatioTTM")
+    ev = pick(metrics, "enterpriseValueOverEBITDATTM", "evToEBITDATTM",
+              "enterpriseValueMultipleTTM", "evToOperatingCashFlowTTM")
+    metric_tile(c1, "P/E (trailing)", num(pe), "pe")
+    metric_tile(c2, "PEG", num(peg), "peg")
+    metric_tile(c3, "EV / EBITDA", num(ev), "ev_ebitda")
 
     # ---- Financial health ----
     st.markdown("#### Financial Health")
     c1, c2, c3, c4 = st.columns(4)
-    nm = ratios.get("netProfitMarginTTM")
-    gm = ratios.get("grossProfitMarginTTM")
-    metric_tile(c1, "Net Margin", pct(to_float(nm) * 100) if to_float(nm) is not None else "N/A", "net_margin")
-    metric_tile(c2, "Gross Margin", pct(to_float(gm) * 100) if to_float(gm) is not None else "N/A", "gross_margin")
-    metric_tile(c3, "Debt / Equity", num(ratios.get("debtEquityRatioTTM")), "debt_equity")
-    metric_tile(c4, "FCF / Share", money(metrics.get("freeCashFlowPerShareTTM")), "fcf_per_share")
+    nm = pick(ratios, "netProfitMarginTTM", "netProfitMargin")
+    gm = pick(ratios, "grossProfitMarginTTM", "grossProfitMargin")
+    de = pick(ratios, "debtToEquityRatioTTM", "debtEquityRatioTTM", "debtToEquityTTM")
+    fcf = pick(metrics, "freeCashFlowPerShareTTM", "freeCashFlowPerShare")
+    metric_tile(c1, "Net Margin", as_pct(nm), "net_margin")
+    metric_tile(c2, "Gross Margin", as_pct(gm), "gross_margin")
+    metric_tile(c3, "Debt / Equity", num(de), "debt_equity")
+    metric_tile(c4, "FCF / Share", money(fcf), "fcf_per_share")
 
     # ---- Trend & risk ----
     st.markdown("#### Trend & Risk")
     c1, c2, c3 = st.columns(3)
-    ma50, ma200 = quote.get("priceAvg50"), quote.get("priceAvg200")
+    ma50 = pick(quote, "priceAvg50")
+    ma200 = pick(quote, "priceAvg200")
     trend_note = None
     m50, m200 = to_float(ma50), to_float(ma200)
     if None not in (p, m50, m200):
@@ -327,7 +386,7 @@ def show_ticker(symbol):
             trend_note = "Price is between its moving averages — a mixed/transitional trend."
     metric_tile(c1, "50-Day Avg", money(ma50), "moving_avg", note=trend_note)
     metric_tile(c2, "200-Day Avg", money(ma200), "moving_avg")
-    metric_tile(c3, "Beta", num(profile.get("beta")), "beta")
+    metric_tile(c3, "Beta", num(pick(profile, "beta")), "beta")
 
     # ---- Your own notes (this decision is yours) ----
     st.markdown("#### Your Notes")
@@ -348,7 +407,6 @@ st.sidebar.markdown("---")
 preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"])
 preset_map = {"Top Gainers": "gainers", "Top Losers": "losers", "Most Active": "actives"}
 
-# Main area
 st.title("Stock Research Dashboard")
 
 if not API_KEY:
@@ -357,8 +415,6 @@ if not API_KEY:
         "**To get started (free, no credit card):**\n"
         "1. Get a free key at https://site.financialmodelingprep.com/developer/docs/dashboard\n"
         "2. Add it to your Streamlit secrets as `FMP_API_KEY = \"your_key\"`\n"
-        "   - Locally: put that line in `.streamlit/secrets.toml`\n"
-        "   - On Streamlit Cloud: App → Settings → Secrets\n"
         "3. Reload this page."
     )
     st.stop()
