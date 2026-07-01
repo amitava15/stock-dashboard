@@ -3,12 +3,11 @@ Stock Research Dashboard  —  provider-layered
 ---------------------------------------------
 The app calls a clean interface — get_quote(), get_company_profile(),
 get_key_metrics(), search_companies() — and doesn't care which provider
-answers. Swapping/adding a provider later means editing one section, not
-the whole app.
+answers. Adding a provider later means editing one section, not the whole app.
 
 Providers wired now:
-  • FMP (free)      -> movers lists + company name search  (work for all tickers)
-  • Finnhub (free)  -> quote, profile, fundamentals        (work for all tickers)
+  • FMP (free)      -> movers lists + company/ticker search  (work for all tickers)
+  • Finnhub (free)  -> quote, profile, fundamentals          (work for all tickers)
 Stubs for later:
   • SEC EDGAR       -> filings          (get_filings, placeholder)
   • Finnhub news    -> news/sentiment   (get_news, placeholder)
@@ -30,78 +29,73 @@ FINNHUB_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 
 
 # ===========================================================================
-# PLAIN-ENGLISH EXPLAINERS  (the "understand finance" layer)
+# PLAIN-ENGLISH EXPLAINERS  (shown as a small "?" tooltip on each metric)
+# Each: what it is in simple terms + what it says about the business.
 # ===========================================================================
 EXPLAINERS = {
     "market_cap": (
-        "**Market capitalization** = share price × number of shares. The total value "
-        "the market places on the whole company.\n\n"
-        "Rough buckets: mega (>$200B), large ($10B–$200B), mid ($2B–$10B), "
-        "small ($300M–$2B), micro (<$300M). Bigger tends to be steadier; smaller can "
-        "move faster, both ways."
+        "How much the whole company is worth on the market (share price × number of shares).\n\n"
+        "**For the business:** it's the market's overall price tag. Bigger companies are usually "
+        "more established and steady; smaller ones can grow — or fall — faster."
     ),
     "pe": (
-        "**Price-to-Earnings (P/E)** = share price ÷ earnings per share. Dollars paid per "
-        "dollar of annual profit.\n\n"
-        "**High** can mean growth expectations *or* an expensive stock; **low** can mean a "
-        "bargain *or* expected trouble. Compare within the same industry — normal P/E "
-        "varies a lot by sector. No P/E usually means no current profit."
+        "How many dollars you pay for each $1 of the company's yearly profit.\n\n"
+        "**For the business:** a high number means investors expect strong future growth (or the "
+        "stock is simply expensive); a low number can mean it's cheap, or that people worry about "
+        "its future. Only meaningful compared with similar companies."
     ),
     "peg": (
-        "**PEG** = P/E ÷ earnings growth rate. Puts the P/E in context of growth.\n\n"
-        "Rule of thumb: ~**1** fair, **<1** possibly undervalued for its growth, **>2** "
-        "possibly pricey. Only meaningful with real, positive earnings growth."
+        "The P/E adjusted for how fast profits are growing.\n\n"
+        "**For the business:** it answers 'is the price fair for the growth you're getting?' Around "
+        "1 is reasonable, well below 1 can be a bargain, well above 2 can be pricey."
     ),
     "ev_ebitda": (
-        "**EV/EBITDA** = enterprise value ÷ EBITDA. A valuation measure that *includes "
-        "debt* (unlike P/E), so it's fairer across companies with different borrowing.\n\n"
-        "**Lower** generally = cheaper. Compare against industry peers."
+        "A price tag that also counts the company's debt, not just its stock.\n\n"
+        "**For the business:** useful for comparing companies that borrow different amounts. Lower "
+        "generally means better value for what you get."
     ),
     "net_margin": (
-        "**Net profit margin** = net profit ÷ revenue. Of every sales dollar, how much "
-        "becomes profit.\n\n"
-        "**Higher** is generally healthier. Varies hugely by industry (software high, "
-        "grocery thin) — compare within a sector."
+        "Out of every $1 in sales, how many cents end up as actual profit.\n\n"
+        "**For the business:** higher means the company keeps more of what it earns — a sign of "
+        "efficiency or strong pricing power. Thin margins leave little room for error."
     ),
     "gross_margin": (
-        "**Gross margin** = (revenue − cost of goods sold) ÷ revenue. Profit after the "
-        "direct cost of making the product, before overhead.\n\n"
-        "High, stable gross margins often signal a strong product or brand."
+        "Profit left after the direct cost of making the product, before other expenses.\n\n"
+        "**For the business:** high, steady gross margins usually point to a strong product or "
+        "brand that customers will pay up for."
     ),
     "debt_equity": (
-        "**Debt-to-Equity** = total debt ÷ shareholder equity. How much the company leans "
-        "on borrowing vs. owners' money.\n\n"
-        "**Higher** = more leverage: potentially higher returns, more risk if earnings "
-        "wobble or rates rise. 'Safe' depends on industry — utilities/telecom carry more.\n\n"
-        "*(Shown here as a percentage: 150 means 1.5× equity.)*"
+        "How much the company relies on borrowed money versus its owners' money.\n\n"
+        "**For the business:** more debt can boost returns but adds risk — if sales dip or interest "
+        "rates rise, heavy debt bites. What's 'safe' depends on the industry. "
+        "(Shown as a %: 150 means 1.5× equity.)"
     ),
     "roe": (
-        "**Return on Equity (ROE)** = net income ÷ shareholder equity. How much profit the "
-        "company squeezes from shareholders' money.\n\n"
-        "**Higher** generally means efficient use of capital — but very high ROE can be "
-        "inflated by heavy debt, so read it next to Debt-to-Equity. Compare within an industry."
+        "How much profit the company makes from the money shareholders have put in.\n\n"
+        "**For the business:** higher means it's using investors' money efficiently — but a very "
+        "high figure can be propped up by heavy borrowing, so read it next to Debt/Equity."
     ),
     "beta": (
-        "**Beta** = how much the stock moves relative to the overall market.\n\n"
-        "≈1 moves with the market · **>1** more volatile · **<1** steadier · **negative** "
-        "moves opposite. Higher beta = more risk *and* more potential reward."
+        "How jumpy the stock is compared to the overall market.\n\n"
+        "**For your risk:** above 1 = bigger swings up and down; below 1 = steadier; 1 = moves with "
+        "the market. Higher beta means more risk and more potential reward."
     ),
     "week_range": (
-        "The **52-week range** is the lowest and highest price over the past year. Where "
-        "today's price sits is a quick read on momentum:\n\n"
-        "Near the **high** → strength (or overextended). Near the **low** → weakness (or a "
-        "bargain, *if* the business is sound)."
+        "The lowest and highest price over the past year.\n\n"
+        "**For the business:** where today's price sits shows momentum — near the high suggests "
+        "strength (or that it's run up a lot); near the low suggests weakness (or a possible bargain "
+        "if the business is solid)."
     ),
     "volume": (
-        "**Average daily volume** is how many shares typically trade per day. It's about "
-        "liquidity and conviction — heavily traded stocks are easier to buy/sell, and big "
-        "price moves on high volume carry more weight than moves on thin volume."
+        "How many shares typically change hands each day.\n\n"
+        "**For tradability:** high volume means the stock is easy to buy and sell, and big price "
+        "moves on high volume carry more conviction than moves on light trading."
     ),
 }
 
 
 # ===========================================================================
-# PROVIDER: FMP  (movers lists + name search — both work for all tickers, free)
+# PROVIDER: FMP  (movers lists + search — both work for all tickers, free)
 # ===========================================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def _fmp_get(path: str):
@@ -192,8 +186,7 @@ def get_news(symbol):
 
 
 # ===========================================================================
-# NORMALIZED INTERFACE  (what the rest of the app calls — provider-agnostic)
-# Units are normalized here so the display layer never has to guess.
+# NORMALIZED INTERFACE  (provider-agnostic; units normalized here)
 # ===========================================================================
 def get_quote(symbol):
     q = _fh_quote(symbol)
@@ -227,7 +220,7 @@ def get_key_metrics(symbol):
     def g(*keys):
         return pick(m, *keys)
 
-    avg_vol_m = g("10DayAverageTradingVolume", "3MonthAverageTradingVolume")  # in millions of shares
+    avg_vol_m = g("10DayAverageTradingVolume", "3MonthAverageTradingVolume")  # millions of shares
     return {
         "pe": g("peTTM", "peBasicExclExtraTTM", "peInclExtraTTM", "peNormalizedAnnual"),
         "peg": g("pegTTM", "pegRatioTTM"),
@@ -300,12 +293,12 @@ def big_count(v):
 
 
 def metric_tile(col, label, value, explainer_key, note=None):
+    """A metric with a small '?' tooltip (hover on desktop, tap on mobile)."""
+    help_text = EXPLAINERS.get(explainer_key, "")
+    if note:
+        help_text = (help_text + "\n\n**This one:** " + note).strip()
     with col:
-        st.metric(label, value)
-        with st.expander("ℹ️ What does this mean?"):
-            st.markdown(EXPLAINERS.get(explainer_key, "_No explainer yet._"))
-            if note:
-                st.info(note)
+        st.metric(label, value, help=help_text or None)
 
 
 # ===========================================================================
@@ -351,7 +344,6 @@ def show_ticker(symbol):
             "**One quick setup step to unlock stock details (free):**\n"
             "1. Get a free key at https://finnhub.io/register\n"
             "2. Add it to your Streamlit secrets as `FINNHUB_API_KEY = \"your_key\"`\n"
-            "   (App → Settings → Secrets — same place as your FMP key)\n"
             "3. Reload. The movers lists already work without it."
         )
         return
@@ -410,7 +402,7 @@ def show_ticker(symbol):
     p, lo, hi = to_float(price), to_float(low), to_float(high)
     if None not in (p, lo, hi) and hi > lo:
         pos = (p - lo) / (hi - lo) * 100
-        range_note = f"Today's price sits about {pos:.0f}% of the way up its 52-week range."
+        range_note = f"Price sits about {pos:.0f}% of the way up its 52-week range."
     metric_tile(c3, "52-Week Range", range_val, "week_range", note=range_note)
 
     metric_tile(c4, "Avg Daily Volume", big_count(metrics.get("avg_volume")), "volume")
@@ -445,7 +437,7 @@ def show_ticker(symbol):
     st.text_area("What's your read on this one?", key=f"notes_{symbol}", height=120,
                  placeholder="e.g. Strong margins but debt looks high for the sector — check latest earnings before deciding.")
 
-    st.caption("ℹ️ Some metrics (PEG, EV/EBITDA) may show N/A on the free data tier — the app stays fully usable without them.")
+    st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics (PEG, EV/EBITDA) may show N/A on the free data tier — the app stays fully usable without them.")
 
 
 # ===========================================================================
@@ -475,7 +467,7 @@ if search_term:
             selected_symbol = options[choice]
     if selected_symbol is None:
         selected_symbol = search_term.upper()
-        st.sidebar.caption(f"No name matches — trying **{selected_symbol}** as a ticker.")
+        st.sidebar.caption(f"No stock matches — trying **{selected_symbol}** as a ticker.")
 
 st.sidebar.markdown("---")
 preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"])
