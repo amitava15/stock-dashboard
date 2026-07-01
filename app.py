@@ -162,13 +162,26 @@ def get_profile(symbol):      return _first(f"profile?symbol={symbol}")
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_companies(query: str):
-    """Look up tickers by company name (or partial name/ticker)."""
+    """Look up tickers by company name (or partial name/ticker).
+
+    Results are sorted so major US exchanges (which the free tier covers)
+    appear first — otherwise a small OTC listing can outrank the one you want.
+    """
     q = requests.utils.quote(query)
     try:
         data = fmp_get(f"search-name?query={q}")
     except requests.HTTPError:
         return []
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+
+    major = {"NASDAQ", "NYSE", "AMEX", "NYSEARCA", "BATS"}
+
+    def rank(m):
+        exch = (m.get("exchangeShortName") or m.get("exchange") or "").upper()
+        return 0 if exch in major else 1
+
+    return sorted(data, key=rank)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +311,18 @@ def show_ticker(symbol):
     try:
         quote = get_quote(symbol)
     except requests.HTTPError as e:
-        st.error(f"Couldn't fetch data for {symbol}. Check the ticker, or the API limit may be reached. ({e})")
+        status = getattr(e.response, "status_code", None)
+        if status == 402:
+            st.warning(
+                f"**{symbol}** isn't available on the free data plan — this usually means it's "
+                "listed on an OTC or non-US exchange that the free tier doesn't cover. "
+                "Try the company's main listing on NASDAQ or NYSE instead "
+                "(e.g. Micron Technology is **MU**, not MICR)."
+            )
+        elif status == 429:
+            st.warning("Daily API limit reached (250 calls/day). It resets tomorrow — or try again in a bit.")
+        else:
+            st.error(f"Couldn't fetch data for {symbol}. Double-check the ticker. ({e})")
         return
 
     if not quote:
