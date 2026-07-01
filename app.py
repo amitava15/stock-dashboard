@@ -65,10 +65,11 @@ h3, h4{ font-family:'Fraunces', Georgia, serif !important; font-weight:500 !impo
     font-family:'IBM Plex Sans', sans-serif !important; font-size:.7rem !important;
     letter-spacing:.11em; text-transform:uppercase; color:var(--muted) !important; font-weight:500; }
 
-/* Metric values — serif tabular figures (menu prices) */
+/* Metric values — clean sans, uniform size (match the label font) */
 [data-testid="stMetricValue"]{
-    font-family:'Fraunces', Georgia, serif !important; font-weight:500 !important;
-    font-variant-numeric:tabular-nums; letter-spacing:-0.01em; color:var(--ink); }
+    font-family:'IBM Plex Sans', sans-serif !important; font-weight:500 !important;
+    font-variant-numeric:tabular-nums; letter-spacing:0; color:var(--ink);
+    font-size:1.35rem !important; line-height:1.25 !important; }
 
 [data-testid="stMetricDelta"]{ font-family:'IBM Plex Sans', sans-serif !important; font-weight:500; }
 [data-testid="stMetricLabel"] svg{ opacity:.55; }
