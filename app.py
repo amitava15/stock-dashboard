@@ -135,7 +135,7 @@ def fmp_get(path: str):
 MOVER_ENDPOINTS = {
     "gainers": "biggest-gainers",
     "losers": "biggest-losers",
-    "actives": "most-active",
+    "actives": "most-actives",
 }
 
 
