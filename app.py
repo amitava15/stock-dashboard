@@ -70,6 +70,9 @@ h3, h4{ font-family:'Fraunces', Georgia, serif !important; font-weight:500 !impo
     font-family:'IBM Plex Sans', sans-serif !important; font-weight:500 !important;
     font-variant-numeric:tabular-nums; letter-spacing:0; color:var(--ink);
     font-size:1.35rem !important; line-height:1.25 !important; }
+/* Kill Streamlit's auto green/red tint on values inside the range strings */
+[data-testid="stMetricValue"] *{
+    color:var(--ink) !important; font-size:inherit !important; font-family:inherit !important; }
 
 [data-testid="stMetricDelta"]{ font-family:'IBM Plex Sans', sans-serif !important; font-weight:500; }
 [data-testid="stMetricLabel"] svg{ opacity:.55; }
