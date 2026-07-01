@@ -120,23 +120,43 @@ def get_movers(kind: str):
     return data if isinstance(data, list) else []
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def search_companies(query: str):
-    """Name -> ticker lookup, major US exchanges sorted first."""
+US_STOCK_EXCHANGES = {"NASDAQ", "NYSE", "AMEX"}
+
+
+def _search_raw(endpoint: str, query: str):
     q = requests.utils.quote(query)
     try:
-        data = _fmp_get(f"search-name?query={q}")
+        data = _fmp_get(f"{endpoint}?query={q}")
     except requests.HTTPError:
         return []
-    if not isinstance(data, list):
-        return []
-    major = {"NASDAQ", "NYSE", "AMEX", "NYSEARCA", "BATS"}
+    return data if isinstance(data, list) else []
 
-    def rank(m):
-        exch = (m.get("exchangeShortName") or m.get("exchange") or "").upper()
-        return 0 if exch in major else 1
 
-    return sorted(data, key=rank)
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_companies(query: str):
+    """Find real US-listed stocks by ticker OR company name.
+
+    Searches both the symbol and name endpoints, keeps only major US stock
+    exchanges, drops mutual funds / forex / crypto, and puts an exact ticker
+    match first — so typing 'MU' surfaces Micron, not a mutual fund.
+    """
+    qup = query.upper().strip()
+    combined = {}
+    for endpoint in ("search-symbol", "search-name"):
+        for m in _search_raw(endpoint, query):
+            sym = (m.get("symbol") or "").upper()
+            if not sym:
+                continue
+            exch = (m.get("exchangeShortName") or m.get("exchange") or "").upper()
+            if exch not in US_STOCK_EXCHANGES:        # drop forex/crypto/foreign/etc.
+                continue
+            if len(sym) == 5 and sym.endswith("X"):   # drop obvious mutual funds
+                continue
+            combined.setdefault(sym, m)
+
+    results = list(combined.values())
+    results.sort(key=lambda m: 0 if (m.get("symbol") or "").upper() == qup else 1)
+    return results
 
 
 # ===========================================================================
@@ -342,6 +362,11 @@ def show_ticker(symbol):
         status = getattr(e.response, "status_code", None)
         if status == 401:
             st.error("Finnhub rejected the API key. Double-check `FINNHUB_API_KEY` in your Streamlit secrets.")
+        elif status == 403:
+            st.warning(
+                f"**{symbol}** isn't covered by the free stock data — it's likely a fund, forex pair, "
+                "index, or non-US listing. Try a common US-listed stock (e.g. **MU** for Micron)."
+            )
         elif status == 429:
             st.warning("Hit Finnhub's rate limit (60/min on free). Wait a minute and try again.")
         else:
