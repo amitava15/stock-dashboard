@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -2913,7 +2913,10 @@ def render_top_stocks():
         m = r["m"]
         c = st.columns([3.4, 1.15, 1.15, 1.15, 1.0, 0.95])
         with c[0]:
-            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}</div>"
+            _px = r["m"].get("price")
+            _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
+                    f"${_px:,.2f}</span>") if _px is not None else ""
+            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
                         f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>",
                         unsafe_allow_html=True)
         with c[1]:
