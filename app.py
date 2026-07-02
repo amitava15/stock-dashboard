@@ -633,6 +633,41 @@ def _nearest_future_estimate(rows):
     return best[1] if best else None
 
 
+def _parse_quarterly(inc, cf, n=6):
+    """Merge quarterly income + cash-flow rows (FMP arrives newest-first) into
+    chronological trend series. Margins are computed from the statement fields."""
+    def key(r):
+        return (str(r.get("fiscalYear") or ""), str(r.get("period") or ""))
+    fcf_by = {key(r): to_float(pick(r, "freeCashFlow")) for r in (cf or [])}
+    rows = list(reversed(list(inc or [])))[-n:]
+    labels, rev, eps, gm, om, nm, fcf = [], [], [], [], [], [], []
+    for r in rows:
+        fy, per = str(r.get("fiscalYear") or ""), str(r.get("period") or "")
+        lab = f"{per} '{fy[2:]}" if len(fy) == 4 else (per or fy or str(r.get("date"))[:10])
+        revenue = to_float(pick(r, "revenue"))
+        gp = to_float(pick(r, "grossProfit"))
+        oi = to_float(pick(r, "operatingIncome"))
+        ni = to_float(pick(r, "netIncome", "bottomLineNetIncome"))
+        labels.append(lab)
+        rev.append(revenue)
+        eps.append(to_float(pick(r, "epsDiluted", "eps")))
+        gm.append((gp / revenue * 100) if (gp is not None and revenue) else None)
+        om.append((oi / revenue * 100) if (oi is not None and revenue) else None)
+        nm.append((ni / revenue * 100) if (ni is not None and revenue) else None)
+        fcf.append(fcf_by.get(key(r)))
+    return {"labels": labels, "metrics": {"revenue": rev, "eps": eps,
+            "gross_margin": gm, "op_margin": om, "net_margin": nm, "fcf": fcf}}
+
+
+def get_quarterly_trend(symbol, n=6):
+    """Last n quarters of revenue, diluted EPS, margins, and free cash flow
+    (chronological, oldest->newest). Confirmed on FMP Starter via period=quarter."""
+    sym = symbol.upper()
+    inc = _fmp_statement(f"income-statement?symbol={sym}&period=quarter&limit={n}")
+    cf = _fmp_statement(f"cash-flow-statement?symbol={sym}&period=quarter&limit={n}")
+    return _parse_quarterly(inc, cf, n)
+
+
 def get_valuation_growth(symbol, years=6):
     """Current valuation (TTM), growth context (YoY), and each multiple vs its
     own 5-year median. Forward P/E needs analyst estimates and degrades to None
@@ -1128,6 +1163,38 @@ def render_cash_generation(symbol):
     st.caption("Free cash flow is the cash a business generates after reinvesting to keep "
                "running and growing. For long-term investors, strong and growing free cash flow "
                "is often more durable than accounting earnings alone.")
+
+
+def render_quarterly(symbol):
+    q = get_quarterly_trend(symbol)
+    labels, m = q["labels"], q["metrics"]
+    if len(labels) < 2:
+        st.caption("Quarterly data isn't available for this stock on the current plan.")
+        return
+
+    def cell(col, label, key, fmt):
+        with col:
+            st.markdown(f"**{label}**")
+            fig = _trend_chart(labels, m.get(key), fmt)
+            if fig is None:
+                st.caption("Unavailable.")
+            else:
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False}, key=f"q_{symbol}_{key}")
+
+    c1, c2 = st.columns(2)
+    cell(c1, "Revenue", "revenue", "money")
+    cell(c2, "EPS (diluted)", "eps", "eps")
+    c1, c2 = st.columns(2)
+    cell(c1, "Gross Margin", "gross_margin", "pct")
+    cell(c2, "Operating Margin", "op_margin", "pct")
+    c1, c2 = st.columns(2)
+    cell(c1, "Net Margin", "net_margin", "pct")
+    cell(c2, "Free Cash Flow", "fcf", "money")
+
+    st.caption("The last several fiscal quarters (most recent on the right). Quarterly data shows "
+               "inflections annual figures can hide — accelerating or slowing revenue, margin "
+               "turns, and whether cash generation is keeping pace with reported profit.")
 
 
 def _cmp_word(now, med):
@@ -1645,6 +1712,77 @@ def _fmt_series(years, vals, fmt):
     return ", ".join(out) if out else "unavailable"
 
 
+def compute_quality_flags(symbol):
+    """Cheap, in-code data sanity checks — fed to the AI and shown in the UI so
+    the analysis leads with caveats instead of trusting broken numbers. All
+    fetches here are cached, so this is nearly free."""
+    sym = symbol.upper()
+    q = _fmp_quote(sym)
+    tr = get_trajectory_annual(sym)
+    val = get_valuation_growth(sym)
+    ea = get_earnings_context(sym)
+    tm = tr["metrics"]
+    cur = val["current"]
+    last = ea.get("last") or {}
+    notes, missing = [], []
+
+    # 1) missing valuation fields
+    for label, k in (("forward P/E", "forward_pe"), ("PEG", "peg"),
+                     ("EV/EBITDA", "ev_ebitda"), ("P/S", "ps")):
+        if to_float(cur.get(k)) is None:
+            missing.append(label)
+
+    # 2) growth distorted by a prior loss year
+    eps_hist = [to_float(x) for x in (tm.get("eps") or [])]
+    prior_losses = [x for x in eps_hist[:-1] if x is not None and x < 0]
+    ge = to_float(val["growth"].get("eps"))
+    if prior_losses and ge is not None and ge > 100:
+        notes.append(f"EPS growth of about {ge:.0f}% year-over-year is inflated by a prior loss "
+                     "year, so PEG and EPS-growth figures overstate how fast the business is "
+                     "durably growing.")
+
+    # 3) suspiciously low PEG
+    peg = to_float(cur.get("peg"))
+    if peg is not None and 0 < peg < 0.2:
+        notes.append(f"PEG of {peg:.2f} is artificially low (a growth spike off a low or negative "
+                     "base), not evidence the stock is cheap.")
+
+    # 4) quarterly-vs-annual EPS basis mismatch
+    last_q_eps = to_float(last.get("eps_actual"))
+    latest_annual = next((x for x in reversed(eps_hist) if x is not None), None)
+    if (last_q_eps is not None and latest_annual is not None
+            and abs(latest_annual) > 0 and last_q_eps > 1.5 * abs(latest_annual)):
+        notes.append(f"The last-earnings EPS ({last_q_eps:.2f}) is a single quarter, while the "
+                     "trajectory EPS is a full fiscal year — the two are not directly comparable.")
+
+    # 5) implausible margins
+    for label, k in (("gross", "gross_margin"), ("operating", "op_margin"), ("net", "net_margin")):
+        vals = [to_float(x) for x in (tm.get(k) or [])]
+        if any(x is not None and (x > 100 or x < -120) for x in vals):
+            notes.append(f"A {label} margin outside a plausible range appears in the history — "
+                         "treat that year as a possible data glitch.")
+
+    # 6) market cap vs price x shares
+    inc_q = _fmp_statement(f"income-statement?symbol={sym}&period=quarter&limit=1") or [{}]
+    price, mc = to_float(pick(q, "price")), to_float(pick(q, "marketCap"))
+    sh = to_float(pick(inc_q[0], "weightedAverageShsOutDil", "weightedAverageShsOut"))
+    if price and mc and sh:
+        implied = price * sh
+        if abs(implied - mc) / mc > 0.15:
+            notes.append(f"Market cap (~${mc/1e9:.0f}B) doesn't reconcile with price x shares "
+                         f"(~${implied/1e9:.0f}B) — possibly a stale share count or split issue.")
+
+    # 7) EBITDA below EBIT (impossible) in the latest quarter
+    row = inc_q[0]
+    eb, ei = to_float(pick(row, "ebitda")), to_float(pick(row, "ebit"))
+    if eb is not None and ei is not None and eb < ei:
+        per = row.get("period") or "the latest quarter"
+        notes.append(f"Reported EBITDA is below EBIT in {per}, which is mathematically impossible "
+                     "(a data glitch); that quarter's EBITDA and D&A are unreliable.")
+
+    return {"missing_fields": missing, "notes": notes}
+
+
 def _analysis_json(symbol):
     """Assemble everything the dashboard knows into the structured JSON the
     research prompt consumes. Keeps the requested field names, and adds the
@@ -1661,6 +1799,9 @@ def _analysis_json(symbol):
     cur, gro, hist = val["current"], val["growth"], val["history"]
     g, tgt = an["grades"], an["target"]
     nxt, last = ea.get("next") or {}, ea.get("last") or {}
+    ql = get_quarterly_trend(symbol)
+    qm = ql["metrics"]
+    dq = compute_quality_flags(symbol)
 
     def rnd(v, nd=2):
         f = to_float(v)
@@ -1715,6 +1856,15 @@ def _analysis_json(symbol):
             "fcf_per_share": fy_map(cy, cm.get("fcf_ps"), scale=1.0, nd=2),
             "fcf_yield_pct": fy_map(cy, cm.get("fcf_yield"), scale=1.0, nd=2),
         },
+        "recent_quarters": {
+            "labels": ql["labels"],
+            "revenue_billions": [round(v / 1e9, 2) if to_float(v) is not None else None for v in qm["revenue"]],
+            "eps_diluted": qm["eps"],
+            "gross_margin_pct": [round(v, 1) if v is not None else None for v in qm["gross_margin"]],
+            "operating_margin_pct": [round(v, 1) if v is not None else None for v in qm["op_margin"]],
+            "net_margin_pct": [round(v, 1) if v is not None else None for v in qm["net_margin"]],
+            "fcf_billions": [round(v / 1e9, 2) if to_float(v) is not None else None for v in qm["fcf"]],
+        },
         "valuation": {
             "pe": rnd(cur.get("pe")),
             "forward_pe": rnd(cur.get("forward_pe")),
@@ -1760,6 +1910,7 @@ def _analysis_json(symbol):
             "volume_vs_avg": rnd(tech.get("vol_ratio")),
             "beta": rnd(m.get("beta") or prof.get("beta")),
         },
+        "data_quality": dq,
     }
     return _json.dumps(data, indent=2)
 
@@ -2455,9 +2606,11 @@ def show_ticker(symbol):
     # ---------------- BUSINESS: fundamentals over time ----------------
     with tab_business:
         section("Business Trajectory", "the shape of the business")
-        st.caption("How the fundamentals have moved over recent fiscal years (annual). "
-                   "A quarterly view is planned.")
+        st.caption("How the fundamentals have moved over recent fiscal years (annual).")
         render_trajectory(symbol)
+
+        section("Recent Quarters", "the last few quarters up close")
+        render_quarterly(symbol)
 
         section("Cash Generation", "does it make real money?")
         render_cash_generation(symbol)
@@ -2509,6 +2662,17 @@ def show_ticker(symbol):
     # ---------------- AI ANALYSIS (its own tab, last) ----------------
     with tab_ai:
         section("AI Analysis", "the whole picture, in plain English")
+        _dq = compute_quality_flags(symbol)
+        _n = len(_dq["notes"]) + (1 if _dq["missing_fields"] else 0)
+        if _n:
+            with st.expander(f"⚠️ Data quality notes ({_n})"):
+                for _note in _dq["notes"]:
+                    st.markdown(f"- {_note}")
+                if _dq["missing_fields"]:
+                    st.markdown(f"- Unavailable on the current data tier: "
+                                f"{', '.join(_dq['missing_fields'])}.")
+                st.caption("Automatic checks on the raw data. The AI is handed these same flags so "
+                           "it can account for them before drawing conclusions.")
         render_ai_analysis(symbol)
 
 
