@@ -615,18 +615,24 @@ st.sidebar.title("Stock Research")
 st.sidebar.caption("Aggregate the data. Understand the metrics. **You** decide.")
 
 
-def _set_mode(mode):
-    # Remember whether the person last used Search or Browse, so a click on one
-    # doesn't get ignored because the other still holds a value.
-    st.session_state.nav_mode = mode
+def _view_stock(sym):
+    st.session_state.view = {"kind": "stock", "symbol": sym}
 
 
+def _view_movers(mover):
+    st.session_state.view = {"kind": "movers", "mover": mover}
+
+
+# on_click callbacks (below) run at the start of the rerun, before this body,
+# so `view` already reflects the button the person just clicked — no stale state.
+view = st.session_state.get("view", {"kind": "movers", "mover": "gainers"})
+active_mover = view.get("mover") if view.get("kind") == "movers" else None
+
+# --- Search ---
 search_term = st.sidebar.text_input("🔎 Search company or ticker",
                                      placeholder="e.g. Micron  or  MU",
-                                     key="search_box",
-                                     on_change=_set_mode, args=("search",)).strip()
-
-selected_symbol = None
+                                     key="search_box").strip()
+candidate = None
 if search_term:
     matches = search_companies(search_term)
     if matches:
@@ -637,21 +643,27 @@ if search_term:
                 continue
             nm = m.get("name") or sym
             exch = m.get("exchangeShortName") or m.get("exchange") or ""
-            label = f"{nm} ({sym})" + (f" · {exch}" if exch else "")
-            options[label] = sym
+            options[f"{nm} ({sym})" + (f" · {exch}" if exch else "")] = sym
         if options:
             choice = st.sidebar.selectbox("Select a match:", list(options.keys()),
-                                          key="match_select",
-                                          on_change=_set_mode, args=("search",))
-            selected_symbol = options[choice]
-    if selected_symbol is None:
-        selected_symbol = search_term.upper()
-        st.sidebar.caption(f"No stock matches — trying **{selected_symbol}** as a ticker.")
+                                          key="match_select")
+            candidate = options[choice]
+    if candidate is None:
+        candidate = search_term.upper()
+        st.sidebar.caption(f"No stock matches — trying **{candidate}** as a ticker.")
+    if candidate:
+        on_stock = view.get("kind") == "stock" and view.get("symbol") == candidate
+        st.sidebar.button(f"View {candidate} details  →", use_container_width=True,
+                          type="primary" if on_stock else "secondary",
+                          on_click=_view_stock, args=(candidate,))
 
+# --- Browse movers ---
 st.sidebar.markdown("---")
-preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"],
-                          key="movers_radio", on_change=_set_mode, args=("movers",))
-preset_map = {"Top Gainers": "gainers", "Top Losers": "losers", "Most Active": "actives"}
+st.sidebar.caption("Browse movers")
+for _label, _key in [("Top Gainers", "gainers"), ("Top Losers", "losers"), ("Most Active", "actives")]:
+    st.sidebar.button(_label, use_container_width=True,
+                      type="primary" if active_mover == _key else "secondary",
+                      on_click=_view_movers, args=(_key,))
 
 st.title("Stock Research Dashboard")
 
@@ -666,13 +678,10 @@ if not FMP_KEY:
     )
     st.stop()
 
-nav_mode = st.session_state.get("nav_mode", "movers")
-show_detail = (nav_mode == "search") and bool(selected_symbol)
-
-if show_detail:
-    show_ticker(selected_symbol)
+if view.get("kind") == "stock":
+    show_ticker(view["symbol"])
 else:
-    show_movers(preset_map[preset])
+    show_movers(view.get("mover", "gainers"))
 
 st.markdown("---")
 st.caption(
