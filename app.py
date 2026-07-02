@@ -200,6 +200,16 @@ EXPLAINERS = {
         "**For the business:** shows whether the market is paying more per dollar of sales than it "
         "usually has. A big jump often signals rich expectations."
     ),
+    "analyst_consensus": (
+        "The overall buy / hold / sell recommendation across analysts covering the stock.\n\n"
+        "**For context:** it reflects professional sentiment, but analysts often lag events and tend "
+        "to cluster together. Treat it as one input, not an answer."
+    ),
+    "implied_upside": (
+        "How far the average analyst price target sits above (or below) today's price.\n\n"
+        "**For context:** targets are estimates and get revised often. A large implied upside can "
+        "mean a bargain — or that analysts are too optimistic."
+    ),
 }
 
 
@@ -572,6 +582,23 @@ def _yoy(series):
     return (pts[-1] - pts[-2]) / abs(pts[-2]) * 100
 
 
+def _nearest_future_estimate(rows):
+    """From analyst-estimate rows, the one whose fiscal-year-end is soonest but
+    still on/after today (the nearest forward year). None if none qualify."""
+    import datetime as _dt
+    today = _dt.date.today()
+    best = None
+    for r in rows or []:
+        ds = str(r.get("date") or r.get("fiscalYear") or "")[:10]
+        try:
+            dd = _dt.date.fromisoformat(ds) if len(ds) == 10 else _dt.date(int(ds[:4]), 1, 1)
+        except (ValueError, TypeError):
+            continue
+        if dd >= today and (best is None or dd < best[0]):
+            best = (dd, r)
+    return best[1] if best else None
+
+
 def get_valuation_growth(symbol, years=6):
     """Current valuation (TTM), growth context (YoY), and each multiple vs its
     own 5-year median. Forward P/E needs analyst estimates and degrades to None
@@ -626,19 +653,12 @@ def get_valuation_growth(symbol, years=6):
     # Forward P/E from analyst estimates (may be gated -> stays None).
     fwd_pe = None
     price = to_float(pick(q, "price"))
-    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=5")
-    if est and price is not None:
-        import datetime as _dt
-        this_year = _dt.date.today().year
-        best = None
-        for r in est:
-            yr = str(r.get("date") or r.get("fiscalYear") or "")[:4]
-            eps_est = to_float(pick(r, "epsAvg", "estimatedEpsAvg", "estimatedEps", "epsEstimated"))
-            if eps_est and eps_est > 0 and yr.isdigit() and int(yr) >= this_year:
-                if best is None or int(yr) < best[0]:
-                    best = (int(yr), eps_est)
-        if best:
-            fwd_pe = price / best[1]
+    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12")
+    row = _nearest_future_estimate(est)
+    if row and price is not None:
+        eps_est = to_float(pick(row, "epsAvg", "estimatedEpsAvg", "estimatedEps", "epsEstimated"))
+        if eps_est and eps_est > 0:
+            fwd_pe = price / eps_est
 
     return {
         "current": {"pe": pe, "forward_pe": fwd_pe, "peg": peg,
@@ -651,6 +671,83 @@ def get_valuation_growth(symbol, years=6):
         },
         "years": order,
     }
+
+
+def get_analyst(symbol):
+    """Consensus, price targets, and nearest-year forward estimates."""
+    sym = symbol.upper()
+    gr = _fmp_first(f"grades-consensus?symbol={sym}")
+    pt = _fmp_first(f"price-target-consensus?symbol={sym}")
+    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12")
+    price = to_float(pick(_fmp_quote(sym), "price"))
+    fwd = _nearest_future_estimate(est) or {}
+    target = to_float(pick(pt, "targetConsensus"))
+    upside = ((target / price - 1) * 100) if (target and price) else None
+    return {
+        "consensus": pick(gr, "consensus"),
+        "grades": {k: to_float(pick(gr, k)) for k in
+                   ("strongBuy", "buy", "hold", "sell", "strongSell")},
+        "target": {"low": to_float(pick(pt, "targetLow")), "avg": target,
+                   "median": to_float(pick(pt, "targetMedian")),
+                   "high": to_float(pick(pt, "targetHigh")), "upside": upside},
+        "price": price,
+        "forward": {"year": str(pick(fwd, "date") or "")[:4],
+                    "revenue": to_float(pick(fwd, "revenueAvg")),
+                    "eps": to_float(pick(fwd, "epsAvg")),
+                    "n_rev": to_float(pick(fwd, "numAnalystsRevenue")),
+                    "n_eps": to_float(pick(fwd, "numAnalystsEps"))},
+    }
+
+
+def get_earnings_context(symbol):
+    """Next earnings date, last actual-vs-estimate, and CIK for EDGAR links."""
+    import datetime as _dt
+    sym = symbol.upper()
+    rows = _fmp_statement(f"earnings?symbol={sym}&limit=12")
+    today = _dt.date.today()
+
+    def parse(r):
+        try:
+            return _dt.date.fromisoformat(str(r.get("date"))[:10])
+        except (ValueError, TypeError):
+            return None
+
+    nxt = last = None
+    for r in rows or []:
+        d = parse(r)
+        if d is None:
+            continue
+        has_actual = pick(r, "epsActual") is not None
+        if (d >= today or not has_actual) and (nxt is None or d < parse(nxt)):
+            nxt = r
+        if has_actual and (last is None or d > parse(last)):
+            last = r
+
+    cik = None
+    inc = _fmp_statement(f"income-statement?symbol={sym}&period=annual&limit=1")
+    if inc:
+        cik = pick(inc[0], "cik")
+
+    def surprise(a, e):
+        a, e = to_float(a), to_float(e)
+        return ((a - e) / abs(e) * 100) if (a is not None and e not in (None, 0)) else None
+
+    out = {"cik": cik}
+    if nxt:
+        d = parse(nxt)
+        out["next"] = {"date": d.isoformat() if d else None,
+                       "days": (d - today).days if d else None,
+                       "eps_est": to_float(pick(nxt, "epsEstimated")),
+                       "rev_est": to_float(pick(nxt, "revenueEstimated"))}
+    if last:
+        out["last"] = {"date": parse(last).isoformat(),
+                       "eps_actual": to_float(pick(last, "epsActual")),
+                       "eps_est": to_float(pick(last, "epsEstimated")),
+                       "eps_surprise": surprise(pick(last, "epsActual"), pick(last, "epsEstimated")),
+                       "rev_actual": to_float(pick(last, "revenueActual")),
+                       "rev_est": to_float(pick(last, "revenueEstimated")),
+                       "rev_surprise": surprise(pick(last, "revenueActual"), pick(last, "revenueEstimated"))}
+    return out
 
 
 # ===========================================================================
@@ -1103,6 +1200,144 @@ def render_valuation_growth(symbol):
     st.caption("Comparison to a *peer* median is coming with the Peer Context section.")
 
 
+def _consensus_bar(grades):
+    cats = [("Strong Buy", "strongBuy", "#2F6B4F"), ("Buy", "buy", "#4E8B6B"),
+            ("Hold", "hold", MUTED), ("Sell", "sell", "#C06B58"),
+            ("Strong Sell", "strongSell", NEG)]
+    total = sum((grades.get(k) or 0) for _, k, _ in cats)
+    if total <= 0:
+        return None
+    fig = go.Figure()
+    for label, key, color in cats:
+        v = grades.get(key) or 0
+        if v <= 0:
+            continue
+        fig.add_trace(go.Bar(
+            x=[v], y=["r"], orientation="h", marker=dict(color=color),
+            text=f"{label.replace('Strong ', 'S. ')} {int(v)}", textposition="inside",
+            insidetextanchor="middle", textfont=dict(color="#FCFBF8", size=11),
+            hovertemplate=f"{label}: {int(v)}<extra></extra>"))
+    fig.update_layout(barmode="stack", height=64, margin=dict(l=6, r=6, t=4, b=4),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      showlegend=False,
+                      xaxis=dict(visible=False, fixedrange=True),
+                      yaxis=dict(visible=False, fixedrange=True))
+    return fig
+
+
+def _analyst_read(a):
+    bits = []
+    if a.get("consensus"):
+        bits.append(f"analysts lean **{a['consensus']}**")
+    up = a["target"].get("upside")
+    if up is not None:
+        bits.append(f"the average target implies **{up:+,.0f}%** {'upside' if up >= 0 else 'downside'}")
+    if not bits:
+        return "Analyst data is limited on the current plan."
+    return ("**Expectation read:** " + ", and ".join(bits) +
+            ". Strong expectations can already be priced in — this isn't a recommendation.")
+
+
+def render_analyst(symbol):
+    a = get_analyst(symbol)
+    gr, tg, fw = a["grades"], a["target"], a["forward"]
+    total = sum(v or 0 for v in gr.values())
+    if not total and not tg.get("avg") and not fw.get("eps"):
+        st.caption("Unavailable from current data source.")
+        return
+
+    if total:
+        _subgroup("Analyst Consensus")
+        fig = _consensus_bar(gr)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": False}, key=f"consensus_{symbol}")
+        c = st.columns(4)
+        metric_tile(c[0], "Consensus", a.get("consensus") or "N/A", "analyst_consensus")
+        with c[1]:
+            st.metric("Buy", f"{int((gr.get('strongBuy') or 0) + (gr.get('buy') or 0))}")
+        with c[2]:
+            st.metric("Hold", f"{int(gr.get('hold') or 0)}")
+        with c[3]:
+            st.metric("Sell", f"{int((gr.get('sell') or 0) + (gr.get('strongSell') or 0))}")
+
+    if tg.get("avg") is not None:
+        _subgroup("Price Target")
+        c = st.columns(4)
+        with c[0]:
+            st.metric("Low", money(tg.get("low")))
+        with c[1]:
+            st.metric("Average", money(tg.get("avg")))
+        with c[2]:
+            st.metric("High", money(tg.get("high")))
+        metric_tile(c[3], "Implied Upside", pct(tg.get("upside")), "implied_upside")
+
+    if fw.get("eps") is not None or fw.get("revenue") is not None:
+        _subgroup("Forward Estimates")
+        yr = fw.get("year") or ""
+        tag = f"FY{yr[2:]}" if len(yr) == 4 else "next yr"
+        c = st.columns(3)
+        with c[0]:
+            st.metric(f"Est. Revenue ({tag})", big_money(fw.get("revenue")))
+        with c[1]:
+            st.metric(f"Est. EPS ({tag})", money(fw.get("eps")))
+        with c[2]:
+            st.metric("Covering Analysts", f"{int(fw.get('n_eps') or 0)} EPS · {int(fw.get('n_rev') or 0)} rev")
+
+    st.caption(_analyst_read(a))
+    st.caption("Estimate revisions (whether these forecasts are drifting up or down over time) need "
+               "saved history — they'll arrive with the Thesis Tracker. Recent upgrades / downgrades "
+               "are planned too.")
+
+
+def _beat_str(surprise_pct):
+    if surprise_pct is None:
+        return None
+    return f"{'beat' if surprise_pct >= 0 else 'missed'} by {abs(surprise_pct):,.0f}%"
+
+
+def render_earnings(symbol):
+    e = get_earnings_context(symbol)
+    nxt, last, cik = e.get("next"), e.get("last"), e.get("cik")
+    if not nxt and not last:
+        st.caption("Unavailable from current data source.")
+        return
+
+    if nxt:
+        _subgroup("Next Earnings")
+        c = st.columns(3)
+        with c[0]:
+            st.metric("Date", nxt.get("date") or "N/A")
+        days = nxt.get("days")
+        with c[1]:
+            st.metric("Days Away", f"{days}" if days is not None else "N/A")
+        with c[2]:
+            st.metric("EPS Estimate", money(nxt.get("eps_est")))
+        if days is not None and 0 <= days <= 7:
+            st.warning(f"⚠️ Earnings are ~{days} day(s) away — the stock may move materially on the release.")
+
+    if last:
+        _subgroup("Last Earnings — Actual vs Estimate")
+        c = st.columns(2)
+        with c[0]:
+            st.metric("EPS", money(last.get("eps_actual")))
+            beat = _beat_str(last.get("eps_surprise"))
+            st.caption(f"est. {money(last.get('eps_est'))}" + (f" · **{beat}**" if beat else ""))
+        with c[1]:
+            st.metric("Revenue", big_money(last.get("rev_actual")))
+            beat = _beat_str(last.get("rev_surprise"))
+            st.caption(f"est. {big_money(last.get('rev_est'))}" + (f" · **{beat}**" if beat else ""))
+
+    _subgroup("SEC Filings")
+    if cik:
+        base = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&owner=include&count=40"
+        st.markdown(f"[10-K (annual)]({base}&type=10-K) &nbsp;·&nbsp; [10-Q (quarterly)]({base}&type=10-Q) "
+                    f"&nbsp;·&nbsp; [8-K (events)]({base}&type=8-K) &nbsp;·&nbsp; [All filings]({base}&type=)")
+    else:
+        st.caption("Filing links unavailable.")
+    st.caption("Earnings press releases and transcripts are planned.")
+
+
 # ===========================================================================
 # Views
 # ===========================================================================
@@ -1200,6 +1435,14 @@ def show_ticker(symbol):
     # ---- Valuation vs Growth ----
     section("Valuation vs Growth", "is it worth the price?")
     render_valuation_growth(symbol)
+
+    # ---- Analyst Expectations ----
+    section("Analyst Expectations", "what the market already expects")
+    render_analyst(symbol)
+
+    # ---- Earnings & Filings ----
+    section("Earnings & Filings", "what's coming, what just happened")
+    render_earnings(symbol)
 
     # ---- Financial health ----
     section("Financial Health", "how it's doing")
