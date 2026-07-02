@@ -349,6 +349,97 @@ def get_key_metrics(symbol):
     }
 
 
+def _fmp_statement(path):
+    """Fetch a statement list (income / balance-sheet / cash-flow / key-metrics).
+    Returns [] on any error so an unavailable endpoint degrades gracefully."""
+    try:
+        data = _fmp_get(path)
+    except requests.HTTPError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def get_trajectory_annual(symbol, years=6):
+    """Assemble multi-year annual series for the Business Trajectory charts.
+
+    Each metric is a list aligned to `years` (oldest -> newest); a value is None
+    where a field/endpoint isn't available, and a whole metric reads as
+    'unavailable' upstream when every value is None. Income statement is the
+    anchor; if it's empty the section shows a single unavailable note.
+    """
+    sym = symbol.upper()
+    inc = _fmp_statement(f"income-statement?symbol={sym}&period=annual&limit={years}")
+    km = _fmp_statement(f"key-metrics?symbol={sym}&period=annual&limit={years}")
+    cf = _fmp_statement(f"cash-flow-statement?symbol={sym}&period=annual&limit={years}")
+    bs = _fmp_statement(f"balance-sheet-statement?symbol={sym}&period=annual&limit={years}")
+
+    def by_year(rows):
+        out = {}
+        for r in rows or []:
+            y = str(r.get("fiscalYear") or r.get("calendarYear") or "")
+            if not y and r.get("date"):
+                y = str(r["date"])[:4]
+            if y:
+                out.setdefault(y, r)
+        return out
+
+    inc_y, km_y, cf_y, bs_y = by_year(inc), by_year(km), by_year(cf), by_year(bs)
+    if not inc_y:
+        return {"years": [], "metrics": {}}
+
+    order = sorted(inc_y.keys())[-years:]                 # oldest -> newest
+
+    def margin(y, field):                                 # % of revenue
+        row = inc_y.get(y, {})
+        rev = to_float(row.get("revenue"))
+        val = to_float(row.get(field))
+        return (val / rev * 100) if (rev not in (None, 0) and val is not None) else None
+
+    def revenue(y):
+        return to_float(inc_y.get(y, {}).get("revenue"))
+
+    def eps(y):
+        return to_float(pick(inc_y.get(y, {}), "epsDiluted", "eps"))
+
+    def roe(y):
+        v = to_float(pick(km_y.get(y, {}), "returnOnEquity"))
+        return v * 100 if v is not None else None
+
+    def fcf(y):
+        row = cf_y.get(y, {})
+        v = to_float(pick(row, "freeCashFlow"))
+        if v is not None:
+            return v
+        ocf = to_float(pick(row, "operatingCashFlow", "netCashProvidedByOperatingActivities"))
+        capex = to_float(pick(row, "capitalExpenditure"))
+        if ocf is None or capex is None:
+            return None
+        return ocf - abs(capex)                           # capex is a cash outflow
+
+    def debt(y):
+        row = bs_y.get(y, {})
+        v = to_float(pick(row, "totalDebt"))
+        if v is not None:
+            return v
+        st_d = to_float(pick(row, "shortTermDebt"))
+        lt_d = to_float(pick(row, "longTermDebt"))
+        if st_d is None and lt_d is None:
+            return None
+        return (st_d or 0) + (lt_d or 0)
+
+    metrics = {
+        "revenue": [revenue(y) for y in order],
+        "eps": [eps(y) for y in order],
+        "gross_margin": [margin(y, "grossProfit") for y in order],
+        "op_margin": [margin(y, "operatingIncome") for y in order],
+        "net_margin": [margin(y, "netIncome") for y in order],
+        "roe": [roe(y) for y in order],
+        "fcf": [fcf(y) for y in order],
+        "debt": [debt(y) for y in order],
+    }
+    return {"years": order, "metrics": metrics}
+
+
 # ===========================================================================
 # Safe field access + formatting helpers
 # ===========================================================================
@@ -496,6 +587,139 @@ def render_price_chart(symbol):
 
 
 # ===========================================================================
+# BUSINESS TRAJECTORY  (multi-year annual trend charts — full set, grouped)
+# ===========================================================================
+def _money_scale(vals):
+    m = max((abs(v) for v in vals if v is not None), default=0)
+    for size, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if m >= size:
+            return size, unit
+    return 1, ""
+
+
+def _trend_chart(years, values, fmt):
+    """A small, quiet trend line for one metric. None if <2 real points."""
+    pts = [(y, v) for y, v in zip(years, values) if v is not None]
+    if len(pts) < 2:
+        return None
+    xs = [f"FY{y[2:]}" if len(y) == 4 else y for y, _ in pts]
+    ys = [v for _, v in pts]
+
+    tickprefix, ticksuffix, tickformat = "", "", ",.2f"
+    if fmt == "money":
+        scale, unit = _money_scale(ys)
+        ys = [v / scale for v in ys]
+        tickprefix, ticksuffix, tickformat = "$", unit, ",.1f"
+        hov = f"%{{x}}   $%{{y:,.1f}}{unit}<extra></extra>"
+    elif fmt == "pct":
+        ticksuffix, tickformat = "%", ",.0f"
+        hov = "%{x}   %{y:,.1f}%<extra></extra>"
+    elif fmt == "eps":
+        tickprefix, tickformat = "$", ",.2f"
+        hov = "%{x}   $%{y:,.2f}<extra></extra>"
+    else:
+        hov = "%{x}   %{y:,.2f}<extra></extra>"
+
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="lines+markers",
+        line=dict(color=INK, width=2),
+        marker=dict(color=INK, size=6),
+        hovertemplate=hov,
+    ))
+    fig.update_layout(
+        height=200, margin=dict(l=6, r=6, t=6, b=6),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=11),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor=PAPER, bordercolor=LINE,
+                        font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12)),
+        showlegend=False,
+        xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
+                   tickfont=dict(color=MUTED, size=10), fixedrange=True, type="category"),
+        yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot", showline=False,
+                   zeroline=False, ticks="", tickprefix=tickprefix, ticksuffix=ticksuffix,
+                   tickformat=tickformat, tickfont=dict(color=MUTED, size=10), fixedrange=True),
+    )
+    if min(ys) < 0:
+        fig.add_hline(y=0, line=dict(color=LINE, width=1))
+    return fig
+
+
+def _direction(vals):
+    pts = [v for v in (vals or []) if v is not None]
+    if len(pts) < 2 or pts[0] == 0:
+        return None
+    chg = (pts[-1] - pts[0]) / abs(pts[0])
+    return "up" if chg > 0.05 else "down" if chg < -0.05 else "flat"
+
+
+def _trajectory_summary(years, m):
+    rev, nm = _direction(m.get("revenue")), _direction(m.get("net_margin"))
+    if not rev and not nm:
+        return "Not enough history to summarize the trajectory."
+    span = f"FY{years[0][2:]}–FY{years[-1][2:]}" if years and len(years[0]) == 4 else "the period"
+    read = "mixed"
+    if rev == "up" and nm in ("up", "flat"):
+        read = "improving"
+    elif rev == "down" and nm in ("down", "flat"):
+        read = "weakening"
+    words = {"up": "rising", "down": "declining", "flat": "roughly flat"}
+    mwords = {"up": "expanding", "down": "compressing", "flat": "steady"}
+    bits = []
+    if rev:
+        bits.append(f"revenue {words[rev]}")
+    if nm:
+        bits.append(f"net margin {mwords[nm]}")
+    return (f"**Business trajectory: {read}** over {span} — {' and '.join(bits)}. "
+            "This describes the numbers only — it isn't a recommendation.")
+
+
+def _subgroup(label):
+    st.markdown(
+        f'<div style="font:600 .72rem/1 \'IBM Plex Sans\',sans-serif;letter-spacing:.14em;'
+        f'text-transform:uppercase;color:var(--muted,#7A7970);margin:1.3rem 0 .2rem;">{label}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_trajectory(symbol):
+    data = get_trajectory_annual(symbol)
+    years, m = data["years"], data["metrics"]
+    if not years:
+        st.caption("Unavailable from current data source.")
+        return
+
+    def cell(col, label, key, fmt):
+        with col:
+            st.markdown(f"**{label}**")
+            fig = _trend_chart(years, m.get(key), fmt)
+            if fig is None:
+                st.caption("Unavailable from current data source.")
+            else:
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    _subgroup("Growth")
+    c1, c2 = st.columns(2)
+    cell(c1, "Revenue", "revenue", "money")
+    cell(c2, "EPS (diluted)", "eps", "eps")
+
+    _subgroup("Profitability")
+    c1, c2 = st.columns(2)
+    cell(c1, "Gross Margin", "gross_margin", "pct")
+    cell(c2, "Operating Margin", "op_margin", "pct")
+    c1, c2 = st.columns(2)
+    cell(c1, "Net Margin", "net_margin", "pct")
+    cell(c2, "Return on Equity", "roe", "pct")
+
+    _subgroup("Cash & Balance Sheet")
+    c1, c2 = st.columns(2)
+    cell(c1, "Free Cash Flow", "fcf", "money")
+    cell(c2, "Total Debt", "debt", "money")
+
+    st.caption(_trajectory_summary(years, m))
+
+
+# ===========================================================================
 # Views
 # ===========================================================================
 def show_movers(kind):
@@ -578,6 +802,12 @@ def show_ticker(symbol):
     # ---- Price ----
     section("Price", "the trend over time")
     render_price_chart(symbol)
+
+    # ---- Business Trajectory ----
+    section("Business Trajectory", "the shape of the business")
+    st.caption("How the fundamentals have moved over recent fiscal years (annual). "
+               "A quarterly view is planned.")
+    render_trajectory(symbol)
 
     # ---- Valuation ----
     section("Valuation", "what it costs")
