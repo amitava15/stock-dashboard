@@ -1716,6 +1716,433 @@ def _render_stock_header(symbol, name, industry, exchange, quote):
     )
 
 
+# ===========================================================================
+# PDF EXPORT  — server-side report of the whole stock page (all tabs).
+# Built with reportlab + matplotlib (no browser/Chrome needed). Guarded so the
+# rest of the app keeps running if those packages aren't installed yet.
+# ===========================================================================
+try:
+    import io as _io
+    import os as _os
+    import datetime as _dt
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from reportlab.lib.pagesizes import letter as _LETTER
+    from reportlab.lib.units import inch as _INCH
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+                                    Image as RLImage, HRFlowable)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.utils import ImageReader
+    _PDF_OK = True
+except Exception:
+    _PDF_OK = False
+
+_FONTS_READY = False
+
+
+def _pdf_fonts():
+    """Embed DejaVu (ships with matplotlib) so arrows/dashes/minus signs render
+    as glyphs, not boxes. Falls back to built-ins if the files aren't found."""
+    global _FONTS_READY
+    if _FONTS_READY or not _PDF_OK:
+        return
+    base = _os.path.join(_os.path.dirname(matplotlib.__file__), "mpl-data", "fonts", "ttf")
+    try:
+        pdfmetrics.registerFont(TTFont("Body", _os.path.join(base, "DejaVuSans.ttf")))
+        pdfmetrics.registerFont(TTFont("Body-Bold", _os.path.join(base, "DejaVuSans-Bold.ttf")))
+        pdfmetrics.registerFont(TTFont("Head", _os.path.join(base, "DejaVuSerif.ttf")))
+        pdfmetrics.registerFont(TTFont("Head-Bold", _os.path.join(base, "DejaVuSerif-Bold.ttf")))
+        pdfmetrics.registerFontFamily("Body", normal="Body", bold="Body-Bold")
+        pdfmetrics.registerFontFamily("Head", normal="Head", bold="Head-Bold")
+        _FONTS_READY = True
+    except Exception:
+        _FONTS_READY = False
+
+
+def _hf(bold=False):
+    return ("Head-Bold" if bold else "Head") if _FONTS_READY else ("Times-Bold" if bold else "Times-Roman")
+
+
+def _bf(bold=False):
+    return ("Body-Bold" if bold else "Body") if _FONTS_READY else ("Helvetica-Bold" if bold else "Helvetica")
+
+
+def _fig_png(fig, dpi=200):
+    buf = _io.BytesIO()
+    FigureCanvasAgg(fig)
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
+    buf.seek(0)
+    return buf
+
+
+def _pdf_trend(ax, years, values, fmt):
+    """Option-A line + points with value labels and the dark zero baseline for
+    negatives — the same reading as the on-screen charts."""
+    pts = [(y, v) for y, v in zip(years, values or []) if v is not None]
+    if len(pts) < 2:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "n/a", ha="center", va="center", color=MUTED, fontsize=8)
+        return
+    xs = [f"FY{str(y)[2:]}" if len(str(y)) == 4 else str(y) for y, _ in pts]
+    ys = [v for _, v in pts]
+    if fmt == "money":
+        sc, u = _money_scale(ys); ys = [v / sc for v in ys]; lab = lambda v: f"${v:,.1f}{u}"
+    elif fmt == "pct":
+        lab = lambda v: f"{v:,.0f}%"
+    elif fmt in ("eps", "pershare"):
+        lab = lambda v: f"${v:,.2f}"
+    else:
+        lab = lambda v: f"{v:,.1f}"
+    x = list(range(len(ys)))
+    lo, hi = min(ys), max(ys)
+    span = (hi - lo) or abs(hi) or 1
+    pad = span * 0.32
+    ymin, ymax = lo - pad, hi + pad
+    if lo < 0:
+        ymax = max(ymax, span * 0.06)
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlim(-0.45, len(ys) - 0.55)
+    ax.grid(axis="y", color=LINE, lw=0.6, linestyle=(0, (1, 3)))
+    ax.set_axisbelow(True)
+    ax.plot(x, ys, color=INK, lw=1.4, zorder=3)
+    ax.scatter(x, ys, facecolor=PAPER, edgecolor=INK, s=22, lw=1.4, zorder=4)
+    for xi, v in zip(x, ys):
+        ax.annotate(lab(v), (xi, v), textcoords="offset points",
+                    xytext=(0, 5 if v >= 0 else -11), ha="center", fontsize=6.5, color=INK)
+    if lo < 0:
+        ax.axhline(0, color=INK, lw=1.3, zorder=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(xs, fontsize=6.5, color=MUTED)
+    ax.set_yticks([])
+    ax.tick_params(length=0)
+    for s in ax.spines.values():
+        s.set_visible(False)
+
+
+def _pdf_grid(specs, ncols, cell_w=2.6, cell_h=1.5):
+    nrows = (len(specs) + ncols - 1) // ncols
+    fig = Figure(figsize=(cell_w * ncols, cell_h * nrows), facecolor=PAPER)
+    for i, (title, years, values, fmt) in enumerate(specs):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        ax.set_facecolor(PAPER)
+        _pdf_trend(ax, years, values, fmt)
+        ax.set_title(title, fontsize=8, color=INK, loc="left", pad=6, fontfamily="DejaVu Serif")
+    fig.subplots_adjust(left=0.03, right=0.99, top=0.93, bottom=0.07, hspace=0.55, wspace=0.12)
+    return _fig_png(fig)
+
+
+def _pdf_price(closes):
+    fig = Figure(figsize=(6.6, 2.1), facecolor=PAPER)
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(PAPER)
+    xs = list(range(len(closes)))
+    ax.plot(xs, closes, color=INK, lw=1.4)
+    ax.fill_between(xs, closes, min(closes), color=POS, alpha=0.06)
+    ax.grid(axis="y", color=LINE, lw=0.6, linestyle=(0, (1, 3)))
+    ax.set_axisbelow(True)
+    ax.set_xticks([])
+    ax.tick_params(length=0, labelsize=7, colors=MUTED)
+    for s in ["top", "right", "bottom"]:
+        ax.spines[s].set_visible(False)
+    ax.spines["left"].set_color(LINE)
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.96, bottom=0.05)
+    return _fig_png(fig)
+
+
+def _pdf_consensus(g):
+    order = [("Strong Buy", g.get("strongBuy", 0), "#3D6B52"), ("Buy", g.get("buy", 0), "#4E8B6B"),
+             ("Hold", g.get("hold", 0), MUTED), ("Sell", g.get("sell", 0), "#C06A56"),
+             ("Strong Sell", g.get("strongSell", 0), NEG)]
+    order = [(l, to_float(v) or 0, c) for l, v, c in order if to_float(v)]
+    total = sum(v for _, v, _ in order) or 1
+    fig = Figure(figsize=(6.6, 0.7), facecolor=PAPER)
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(PAPER)
+    left = 0
+    for l, v, c in order:
+        w = v / total
+        ax.barh(0, w, left=left, color=c, height=0.6)
+        if w > 0.06:
+            ax.text(left + w / 2, 0, f"{l} {int(v)}", ha="center", va="center", color="white", fontsize=7.5)
+        left += w
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-0.5, 0.5)
+    ax.axis("off")
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.9, bottom=0.1)
+    return _fig_png(fig)
+
+
+def _pdf_styles():
+    return {
+        "kicker": ParagraphStyle("k", fontName=_bf(), fontSize=7.5, textColor=HexColor(MUTED), leading=10, spaceAfter=2),
+        "h2": ParagraphStyle("h2", fontName=_hf(True), fontSize=14, textColor=HexColor(INK), leading=17, spaceAfter=6),
+        "body": ParagraphStyle("b", fontName=_bf(), fontSize=8.5, textColor=HexColor(INK), leading=12.5),
+        "note": ParagraphStyle("n", fontName=_bf(), fontSize=7.5, textColor=HexColor(MUTED), leading=11, spaceBefore=4),
+        "subg": ParagraphStyle("sg", fontName=_bf(True), fontSize=7.5, textColor=HexColor(MUTED), leading=11, spaceBefore=8, spaceAfter=3),
+        "lab": ParagraphStyle("l", fontName=_bf(), fontSize=7, textColor=HexColor(MUTED), leading=9),
+        "val": ParagraphStyle("v", fontName=_bf(), fontSize=10, textColor=HexColor(INK), leading=13),
+    }
+
+
+def _pdf_section(title, kicker, S):
+    return [Spacer(1, 10), Paragraph(kicker.upper(), S["kicker"]),
+            HRFlowable(width="100%", thickness=0.6, color=HexColor(LINE), spaceBefore=1, spaceAfter=4),
+            Paragraph(title, S["h2"])]
+
+
+def _pdf_tiles(items, S, cols=3):
+    cells = []
+    for it in items:
+        inner = [Paragraph(it[0].upper(), S["lab"]), Paragraph(it[1], S["val"])]
+        if len(it) > 2 and it[2]:
+            inner.append(Paragraph(it[2], S["note"]))
+        cells.append(inner)
+    rows = []
+    for i in range(0, len(cells), cols):
+        row = cells[i:i + cols]
+        while len(row) < cols:
+            row.append("")
+        rows.append(row)
+    usable = 6.5 * _INCH
+    t = Table(rows, colWidths=[usable / cols] * cols)
+    t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                           ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                           ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                           ("LINEBELOW", (0, 0), (-1, -1), 0.5, HexColor(LINE))]))
+    return t
+
+
+def _pdf_img(buf, width_in):
+    ir = ImageReader(buf)
+    iw, ih = ir.getSize()
+    w = width_in * _INCH
+    buf.seek(0)
+    return RLImage(buf, width=w, height=w * ih / iw)
+
+
+def _pdf_range(a, b):
+    """Price range for the PDF. Like money_range but WITHOUT the '$'->'\\$'
+    escaping — that escape exists only for Streamlit's LaTeX; in a PDF it would
+    print a literal backslash."""
+    a, b = to_float(a), to_float(b)
+    if a is None or b is None:
+        return "N/A"
+    return f"${a:,.0f} \u2013 ${b:,.0f}"
+
+
+def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes):
+    _pdf_fonts()
+    S = _pdf_styles()
+    W, H = _LETTER
+    margin = 0.75 * _INCH
+
+    def _decor(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(HexColor(PAPER))
+        canvas.rect(0, 0, W, H, fill=1, stroke=0)
+        canvas.setFont(_bf(), 7)
+        canvas.setFillColor(HexColor(MUTED))
+        canvas.drawString(margin, 0.5 * _INCH, "Aggregated for personal research \u2014 not investment advice.")
+        canvas.drawRightString(W - margin, 0.5 * _INCH, f"{symbol}  \u00b7  page {doc.page}")
+        canvas.restoreState()
+
+    story = []
+    name = profile.get("name") or quote.get("name") or symbol
+    if len(name) > 40:
+        name = name[:38] + "\u2026"
+    sub = " \u00b7 ".join([x for x in [profile.get("industry"), profile.get("exchange") or quote.get("exchange")] if x])
+    chg = to_float(quote.get("change_pct"))
+    chg_str = f"{chg:+.2f}%" if chg is not None else ""
+    price_color = NEG if (chg is not None and chg < 0) else POS if chg is not None else INK
+    left = [Paragraph("STOCK RESEARCH SNAPSHOT", S["kicker"]),
+            Paragraph(f"{symbol} \u2014 {name}", ParagraphStyle("tk", fontName=_hf(True), fontSize=18, textColor=HexColor(INK), leading=21)),
+            Paragraph(sub, S["note"])]
+    right = [Paragraph(money(quote.get("price")), ParagraphStyle("px", fontName=_bf(True), fontSize=16, alignment=TA_RIGHT, textColor=HexColor(INK), leading=19)),
+             Paragraph(chg_str, ParagraphStyle("cx", fontName=_bf(), fontSize=9, alignment=TA_RIGHT, textColor=HexColor(price_color), leading=13)),
+             Paragraph(f"{big_money(profile.get('market_cap') or quote.get('market_cap'))} mkt cap", ParagraphStyle("mc", fontName=_bf(), fontSize=8, alignment=TA_RIGHT, textColor=HexColor(MUTED), leading=12))]
+    htab = Table([[left, right]], colWidths=[4.7 * _INCH, 1.8 * _INCH])
+    htab.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [htab, Paragraph(f"Generated {_dt.datetime.now():%B %d, %Y}", S["note"]),
+              HRFlowable(width="100%", thickness=1.1, color=HexColor(INK), spaceBefore=6, spaceAfter=2)]
+
+    story += _pdf_section("Snapshot", "the essentials", S)
+    story.append(_pdf_tiles([("Price", money(quote.get("price")), chg_str),
+                             ("Market Cap", big_money(profile.get("market_cap") or quote.get("market_cap"))),
+                             ("52-Week Range", _pdf_range(quote.get("week_low"), quote.get("week_high"))),
+                             ("Avg Daily Volume", big_count(metrics.get("avg_volume")))], S, cols=4))
+
+    if closes:
+        story += _pdf_section("Price", "the trend over time", S)
+        story.append(_pdf_img(_pdf_price(closes), 6.5))
+
+    ty, tm = traj["years"], traj["metrics"]
+    story += _pdf_section("Business Trajectory", "the shape of the business", S)
+    story.append(_pdf_img(_pdf_grid([("Revenue", ty, tm.get("revenue"), "money"),
+                                     ("EPS (diluted)", ty, tm.get("eps"), "eps"),
+                                     ("Gross Margin", ty, tm.get("gross_margin"), "pct"),
+                                     ("Operating Margin", ty, tm.get("op_margin"), "pct"),
+                                     ("Net Margin", ty, tm.get("net_margin"), "pct"),
+                                     ("Return on Equity", ty, tm.get("roe"), "pct"),
+                                     ("Free Cash Flow", ty, tm.get("fcf"), "money"),
+                                     ("Total Debt", ty, tm.get("debt"), "money")], ncols=2), 6.5))
+
+    cy, cm = cash["years"], cash["metrics"]
+    story += _pdf_section("Cash Generation", "does it make real money?", S)
+    story.append(_pdf_img(_pdf_grid([("Free Cash Flow", cy, cm.get("fcf"), "money"),
+                                     ("FCF Margin", cy, cm.get("fcf_margin"), "pct"),
+                                     ("FCF per Share", cy, cm.get("fcf_ps"), "pershare"),
+                                     ("FCF Yield", cy, cm.get("fcf_yield"), "pct")], ncols=2, cell_h=1.4), 6.5))
+
+    cur, gro, his = val["current"], val["growth"], val["history"]
+    story += _pdf_section("Valuation vs Growth", "is it worth the price?", S)
+    story.append(Paragraph("CURRENT VALUATION", S["subg"]))
+    story.append(_pdf_tiles([("P/E", num(cur.get("pe"))), ("Forward P/E", num(cur.get("forward_pe"))),
+                             ("PEG", num(cur.get("peg"))), ("EV/EBITDA", num(cur.get("ev_ebitda"))),
+                             ("P/S", num(cur.get("ps"))), ("FCF Yield", pct(cur.get("fcf_yield")))], S, cols=3))
+    story.append(Paragraph("GROWTH CONTEXT (YoY)", S["subg"]))
+    story.append(_pdf_tiles([("Revenue", pct(gro.get("revenue"))), ("EPS", pct(gro.get("eps"))),
+                             ("Free Cash Flow", pct(gro.get("fcf")))], S, cols=3))
+    story.append(Paragraph("HISTORICAL CONTEXT (now vs 5-yr median)", S["subg"]))
+
+    def _hrow(k, lbl):
+        d = his.get(k, {})
+        now, med = to_float(d.get("now")), to_float(d.get("median"))
+        if now is not None and med is not None:
+            tag = "above" if now > med else "below" if now < med else "in line"
+            return (lbl, num(now), f"5-yr median {num(med)} \u00b7 {tag}")
+        return (lbl, num(now), "median n/a")
+
+    story.append(_pdf_tiles([_hrow("pe", "P/E"), _hrow("ev", "EV/EBITDA"), _hrow("ps", "P/S")], S, cols=3))
+
+    story += _pdf_section("Analyst Expectations", "what the market already expects", S)
+    story.append(Paragraph("CONSENSUS", S["subg"]))
+    story.append(_pdf_img(_pdf_consensus(analyst["grades"]), 6.5))
+    tg = analyst["target"]
+    story.append(Paragraph("PRICE TARGET", S["subg"]))
+    story.append(_pdf_tiles([("Low", money(tg.get("low"))), ("Average", money(tg.get("avg"))),
+                             ("High", money(tg.get("high"))), ("Implied Upside", pct(tg.get("upside")))], S, cols=4))
+    fw = analyst["forward"]
+    fy2 = str(fw.get("year"))[2:] if fw.get("year") else "?"
+    story.append(_pdf_tiles([(f"Est. Revenue (FY{fy2})", big_money(fw.get("revenue"))),
+                             (f"Est. EPS (FY{fy2})", money(fw.get("eps")))], S, cols=4))
+
+    story += _pdf_section("Earnings & Filings", "what's coming, what just happened", S)
+    nxt, last = earn.get("next") or {}, earn.get("last") or {}
+    story.append(_pdf_tiles([("Next Earnings", str(nxt.get("date") or "N/A")),
+                             ("Days Away", num(nxt.get("days"), 0)), ("EPS Estimate", money(nxt.get("eps_est")))], S, cols=3))
+    if last:
+        def _surp(x):
+            x = to_float(x)
+            return "" if x is None else (f"beat {x:.0f}%" if x >= 0 else f"miss {abs(x):.0f}%")
+        story.append(Paragraph("LAST EARNINGS \u2014 ACTUAL VS ESTIMATE", S["subg"]))
+        story.append(_pdf_tiles([("EPS", money(last.get("eps_actual")), f"est. {money(last.get('eps_est'))} \u00b7 {_surp(last.get('eps_surprise'))}"),
+                                 ("Revenue", big_money(last.get("rev_actual")), f"est. {big_money(last.get('rev_est'))} \u00b7 {_surp(last.get('rev_surprise'))}")], S, cols=2))
+    cik = earn.get("cik")
+    if cik:
+        b = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&owner=include&count=40&type="
+        story.append(Paragraph(f'SEC filings (EDGAR): <a href="{b}10-K">10-K</a> \u00b7 <a href="{b}10-Q">10-Q</a> \u00b7 <a href="{b}8-K">8-K</a>', S["body"]))
+
+    story += _pdf_section("Price Context", "is the price stretched or reasonable?", S)
+
+    def _ab(x):
+        return "Above" if x else "Below" if x is not None else "N/A"
+
+    vr = to_float(tech.get("vol_ratio"))
+    story.append(_pdf_tiles([("vs 50-day MA", _ab(tech.get("above_50")), money(tech.get("ma50"))),
+                             ("vs 200-day MA", _ab(tech.get("above_200")), money(tech.get("ma200"))),
+                             ("RSI (14)", num(tech.get("rsi"), 0)),
+                             ("From 52-wk High", pct(tech.get("dist_high"))),
+                             ("From 52-wk Low", pct(tech.get("dist_low"))),
+                             ("Volume vs Avg", f"{vr:,.2f}x" if vr is not None else "N/A")], S, cols=3))
+
+    story += _pdf_section("Financial Health & Risk", "how it's doing \u00b7 what could move it", S)
+    story.append(_pdf_tiles([("Net Margin", pct(metrics.get("net_margin_pct"))),
+                             ("Gross Margin", pct(metrics.get("gross_margin_pct"))),
+                             ("Return on Equity", pct(metrics.get("roe_pct"))),
+                             ("Debt / Equity", num(metrics.get("debt_to_equity"))),
+                             ("Beta", num(metrics.get("beta") or profile.get("beta"))),
+                             ("Prev Close", money(quote.get("prev_close")))], S, cols=3))
+
+    if ai_text:
+        story += _pdf_section("AI Analysis", "the whole picture, in plain English", S)
+        for para in str(ai_text).split("\n"):
+            p = para.strip()
+            if not p:
+                continue
+            if p.startswith("#"):
+                story.append(Paragraph(p.lstrip("# ").strip(), S["subg"]))
+            else:
+                story.append(Paragraph(p.replace("**", ""), S["body"]))
+                story.append(Spacer(1, 3))
+        story.append(Paragraph("AI-generated and may contain errors; verify against primary sources. Not a recommendation.", S["note"]))
+
+    if notes and notes.strip():
+        story += _pdf_section("Your Notes", "your call", S)
+        for para in notes.split("\n"):
+            if para.strip():
+                story.append(Paragraph(para.strip(), S["body"]))
+                story.append(Spacer(1, 3))
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=_LETTER, leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=0.75 * _INCH, title=f"{symbol} research snapshot")
+    doc.build(story, onFirstPage=_decor, onLaterPages=_decor)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_pdf_report(symbol):
+    quote = get_quote(symbol)
+    profile = get_company_profile(symbol)
+    metrics = get_key_metrics(symbol)
+    traj = get_trajectory_annual(symbol)
+    cash = get_cash_annual(symbol)
+    val = get_valuation_growth(symbol)
+    analyst = get_analyst(symbol)
+    earn = get_earnings_context(symbol)
+    tech = get_technicals(symbol)
+    closes = None
+    try:
+        df = get_price_history(symbol)
+        if df is not None and not df.empty and "close" in df:
+            c = pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
+            if len(c) >= 2:
+                closes = c
+    except Exception:
+        closes = None
+    ai_text = st.session_state.get("ai_analysis", {}).get(symbol)
+    notes = st.session_state.get(f"notes_{symbol}", "")
+    return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes)
+
+
+def render_pdf_export(symbol):
+    if not _PDF_OK:
+        st.caption("PDF export needs the **reportlab** and **matplotlib** packages — add them to "
+                   "`requirements.txt` and redeploy, and this button will appear.")
+        return
+    st.caption("Save this stock's full research — every tab, charts included — as a PDF. "
+               "Tip: generate the AI analysis and jot your notes first, and they'll be included.")
+    cache = st.session_state.setdefault("pdf_cache", {})
+    if st.button("\U0001F4C4 Generate PDF report", key=f"pdfgen_{symbol}"):
+        with st.spinner("Building your report…"):
+            try:
+                cache[symbol] = build_pdf_report(symbol)
+            except Exception as e:  # noqa: BLE001
+                cache.pop(symbol, None)
+                st.error(f"Couldn't build the PDF: {e}")
+    if cache.get(symbol):
+        st.download_button("\u2B07\uFE0F Download PDF", data=cache[symbol],
+                           file_name=f"{symbol}_research_{_dt.date.today():%Y%m%d}.pdf",
+                           mime="application/pdf", key=f"pdfdl_{symbol}")
+
+
+
 def show_ticker(symbol):
     symbol = symbol.upper().strip()
 
@@ -1816,6 +2243,10 @@ def show_ticker(symbol):
                                  "multiples — is the growth already priced in? Check next earnings before deciding.")
         st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics "
                    "(PEG, EV/EBITDA) may show N/A on the current data tier — the app stays fully usable without them.")
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        section("Export", "take it with you")
+        render_pdf_export(symbol)
 
 
 # ===========================================================================
