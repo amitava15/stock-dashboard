@@ -1694,11 +1694,12 @@ div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]{color
 div[data-testid="stTabs"] div[data-baseweb="tab-highlight"]{background-color:var(--ink,#23231E)}
 div[data-testid="stTabs"] div[data-baseweb="tab-border"]{background-color:transparent}
 
-/* Floating PDF button(s) — reachable from any tab. Bottom-LEFT to avoid
-   Streamlit Cloud's bottom-right "Manage app" badge. */
-.st-key-pdf_fab_gen,.st-key-pdf_fab_dl{position:fixed;left:18px;z-index:1000;width:auto}
-.st-key-pdf_fab_gen{bottom:18px}
-.st-key-pdf_fab_dl{bottom:64px}
+/* Floating PDF button(s) — reachable from any tab. Bottom-RIGHT but raised so
+   it clears BOTH the sidebar (left strip) and Streamlit Cloud's bottom-right
+   "Manage app" badge. */
+.st-key-pdf_fab_gen,.st-key-pdf_fab_dl{position:fixed;right:20px;z-index:9999;width:auto}
+.st-key-pdf_fab_gen{bottom:80px}
+.st-key-pdf_fab_dl{bottom:126px}
 .st-key-pdf_fab_gen button,.st-key-pdf_fab_dl button{
   width:auto;border-radius:999px;padding:.5rem 1rem;font-family:'IBM Plex Sans',sans-serif;
   font-weight:600;font-size:.78rem;letter-spacing:.02em;box-shadow:0 3px 12px rgba(35,35,30,.20)}
