@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -262,6 +262,28 @@ def _fmp_get(path: str):
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+def _fmp_probe(path: str):
+    """Diagnostic fetch (uncached) — returns (rows, http_status, error) WITHOUT
+    swallowing, so the UI can surface exactly why an endpoint came back empty."""
+    sep = "&" if "?" in path else "?"
+    url = f"{FMP_BASE}/{path}{sep}apikey={FMP_KEY}"
+    try:
+        resp = requests.get(url, timeout=15)
+        status = resp.status_code
+        if status != 200:
+            try:
+                detail = str(resp.json())[:180]
+            except Exception:
+                detail = resp.text[:180]
+            return [], status, detail
+        data = resp.json()
+        if not isinstance(data, list):
+            return [], status, f"non-list: {str(data)[:180]}"
+        return data, status, ""
+    except Exception as e:  # noqa: BLE001
+        return [], None, str(e)[:180]
 
 
 MOVER_ENDPOINTS = {"gainers": "biggest-gainers", "losers": "biggest-losers", "actives": "most-actives"}
@@ -1303,6 +1325,19 @@ def render_valuation_growth(symbol):
             st.caption(f"Trailing P/E is **{pe_ttm:.0f}×** but forward P/E is **{fpe1:.0f}×** — "
                        "earnings are expected to fall, so the stock is more expensive against future "
                        "profits than trailing ones suggest.")
+    else:
+        _rows, _status, _err = _fmp_probe(f"analyst-estimates?symbol={symbol.upper()}&period=annual&limit=12")
+        import datetime as _d
+        _future = 0
+        for _r in _rows:
+            try:
+                if _d.date.fromisoformat(str(_r.get("date"))[:10]) >= _d.date.today():
+                    _future += 1
+            except Exception:
+                pass
+        st.caption(f"⚙️ Forward valuation diagnostic — analyst-estimates: HTTP {_status}, "
+                   f"{len(_rows)} rows, {_future} future-dated · server date {_d.date.today()}"
+                   + (f" · error: {_err}" if _err else ""))
 
     _subgroup("Growth Context")
     c = st.columns(3)
