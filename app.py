@@ -18,6 +18,7 @@ This app AGGREGATES and EXPLAINS. It never tells you to buy or sell.
 import streamlit as st
 import requests
 import pandas as pd
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layout="wide")
 
@@ -219,6 +220,29 @@ def search_companies(query: str):
     return results
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def get_price_history(symbol: str):
+    """Daily price history from FMP (arrives newest-first).
+
+    Returns a DataFrame sorted oldest -> newest with a 'date' column and
+    'close'. On the free tier this 402s for real tickers; it works once
+    FMP Starter is active. Any error yields an empty frame (handled upstream).
+    """
+    try:
+        data = _fmp_get(f"historical-price-eod/full?symbol={symbol.upper()}")
+    except requests.HTTPError:
+        return pd.DataFrame()
+    if not isinstance(data, list) or not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    if "date" not in df.columns or "close" not in df.columns:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    return df
+
+
 # ===========================================================================
 # PROVIDER: Finnhub  (quote, profile, fundamentals — work for all tickers, free)
 # ===========================================================================
@@ -373,6 +397,73 @@ def section(title, kicker=""):
     st.markdown(f'<div class="rt-section">{kick}<h2>{title}</h2></div>', unsafe_allow_html=True)
 
 
+# Editorial palette (kept in sync with the CSS block up top)
+INK, PAPER, MUTED, LINE = "#23231E", "#FCFBF8", "#7A7970", "#E8E6DE"
+POS, NEG = "#2F6B4F", "#A24A38"
+RANGE_DAYS = {"1M": 30, "6M": 182, "1Y": 365, "5Y": 365 * 5}
+RANGE_WORDS = {"1M": "over the past month", "6M": "over the past 6 months",
+               "1Y": "over the past year", "5Y": "over the past 5 years"}
+
+
+def render_price_chart(symbol):
+    """A quiet, editorial price line — styled to match the tasting-card look."""
+    df = get_price_history(symbol)
+    if df.empty:
+        st.caption("Price history isn't available for this ticker on the current data plan.")
+        return
+
+    options = list(RANGE_DAYS.keys())
+    picker = getattr(st, "segmented_control", None)
+    if picker:
+        choice = picker("Range", options, default="1Y",
+                        key=f"range_{symbol}", label_visibility="collapsed")
+    else:
+        choice = st.radio("Range", options, index=2, horizontal=True,
+                          key=f"range_{symbol}", label_visibility="collapsed")
+    choice = choice or "1Y"
+
+    cutoff = df["date"].max() - pd.Timedelta(days=RANGE_DAYS[choice])
+    d = df[df["date"] >= cutoff]
+    if len(d) < 2:
+        d = df
+
+    first, last = d["close"].iloc[0], d["close"].iloc[-1]
+    up = last >= first
+    line_color = POS if up else NEG
+    fill_color = "rgba(47,107,79,0.08)" if up else "rgba(162,74,56,0.08)"
+
+    change = (last - first) / first * 100 if first else 0
+    st.caption(f"{'Up' if up else 'Down'} {abs(change):.1f}% {RANGE_WORDS[choice]}.")
+
+    ymin, ymax = d["close"].min(), d["close"].max()
+    pad = (ymax - ymin) * 0.08 or (ymax * 0.05)
+
+    fig = go.Figure(go.Scatter(
+        x=d["date"], y=d["close"], mode="lines",
+        line=dict(color=line_color, width=2),
+        fill="tozeroy", fillcolor=fill_color,
+        hovertemplate="%{x|%b %-d, %Y}   $%{y:.2f}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=340,
+        margin=dict(l=6, r=6, t=6, b=6),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=12),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor=PAPER, bordercolor=LINE,
+                        font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12)),
+        showlegend=False,
+        xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
+                   tickfont=dict(color=MUTED, size=11), fixedrange=True),
+        yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot",
+                   showline=False, zeroline=False, ticks="", tickprefix="$",
+                   tickfont=dict(color=MUTED, size=11),
+                   range=[ymin - pad, ymax + pad], fixedrange=True),
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 # ===========================================================================
 # Views
 # ===========================================================================
@@ -478,6 +569,10 @@ def show_ticker(symbol):
     metric_tile(c3, "52-Week Range", range_val, "week_range", note=range_note)
 
     metric_tile(c4, "Avg Daily Volume", big_count(metrics.get("avg_volume")), "volume")
+
+    # ---- Price ----
+    section("Price", "the trend over time")
+    render_price_chart(symbol)
 
     # ---- Valuation ----
     section("Valuation", "what it costs")
