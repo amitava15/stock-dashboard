@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.10.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -334,15 +334,25 @@ def search_companies(query: str):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_price_history(symbol: str):
+def get_price_history(symbol: str, start_days: int = None):
     """Daily price history from FMP (arrives newest-first).
 
     Returns a DataFrame sorted oldest -> newest with a 'date' column and
-    'close'. On the free tier this 402s for real tickers; it works once
-    FMP Starter is active. Any error yields an empty frame (handled upstream).
+    'close' (the raw 'volume' column is preserved too). On the free tier this
+    402s for real tickers; it works once FMP Starter is active. Any error
+    yields an empty frame (handled upstream).
+
+    start_days: if given, only fetch roughly the last N calendar days (via the
+    endpoint's `from` filter). Default None fetches full history, so existing
+    callers are unchanged; the daily scan passes a small window to stay light.
     """
+    path = f"historical-price-eod/full?symbol={symbol.upper()}"
+    if start_days:
+        import datetime as _dt
+        frm = (_dt.date.today() - _dt.timedelta(days=int(start_days))).isoformat()
+        path += f"&from={frm}"
     try:
-        data = _fmp_get(f"historical-price-eod/full?symbol={symbol.upper()}")
+        data = _fmp_get(path)
     except requests.HTTPError:
         return pd.DataFrame()
     if not isinstance(data, list) or not data:
@@ -1326,18 +1336,7 @@ def render_valuation_growth(symbol):
                        "earnings are expected to fall, so the stock is more expensive against future "
                        "profits than trailing ones suggest.")
     else:
-        _rows, _status, _err = _fmp_probe(f"analyst-estimates?symbol={symbol.upper()}&period=annual&limit=10")
-        import datetime as _d
-        _future = 0
-        for _r in _rows:
-            try:
-                if _d.date.fromisoformat(str(_r.get("date"))[:10]) >= _d.date.today():
-                    _future += 1
-            except Exception:
-                pass
-        st.caption(f"⚙️ Forward valuation diagnostic — analyst-estimates: HTTP {_status}, "
-                   f"{len(_rows)} rows, {_future} future-dated · server date {_d.date.today()}"
-                   + (f" · error: {_err}" if _err else ""))
+        st.caption("Forward estimates aren't available for this stock right now.")
 
     _subgroup("Growth Context")
     c = st.columns(3)
@@ -2666,6 +2665,299 @@ def render_pdf_fab(symbol):
 
 
 
+# ===========================================================================
+# TOP STOCKS TO EXPLORE — a daily "what should I look into" board.
+# Scans a hardcoded quality universe (S&P 500) using ONLY get_price_history,
+# confirms movement across multiple days + volume (so one-day spikes and
+# penny-stock pops don't dominate), scores a Focus Priority, and shows the
+# top 20. Cached once per day; the first load of the day takes ~1-2 minutes
+# while it scans ~500 names, then it's instant for the rest of the day.
+# ===========================================================================
+
+# S&P 500 constituents — snapshot as of 2026-07-02. Index membership drifts a
+# few times a year, so refresh this list periodically. Unknown/delisted tickers
+# simply return no history and are skipped, so a slightly stale list degrades
+# quietly rather than breaking the scan.
+SP500 = (
+    "MMM", "AOS", "ABT", "ABBV", "ACN", "ADBE", "AMD", "AES", "AFL", "A", "APD", "ABNB", "AKAM",
+    "ALB", "ARE", "ALGN", "ALLE", "LNT", "ALL", "GOOGL", "GOOG", "MO", "AMZN", "AMCR", "AEE", "AEP",
+    "AXP", "AIG", "AMT", "AWK", "AMP", "AME", "AMGN", "APH", "ADI", "ANSS", "AON", "APA", "AAPL",
+    "AMAT", "APTV", "ACGL", "ADM", "ANET", "AJG", "AIZ", "T", "ATO", "ADSK", "ADP", "AZO", "AVB",
+    "AVY", "AXON", "BKR", "BALL", "BAC", "BAX", "BDX", "BRK.B", "BBY", "BIO", "TECH", "BIIB", "BLK",
+    "BX", "BK", "BA", "BKNG", "BWA", "BSX", "BMY", "AVGO", "BR", "BRO", "BF.B", "BLDR", "BG", "CDNS",
+    "CZR", "CPT", "CPB", "COF", "CAH", "KMX", "CCL", "CARR", "CTLT", "CAT", "CBOE", "CBRE", "CDW",
+    "CE", "COR", "CNC", "CNP", "CF", "CHRW", "CRL", "SCHW", "CHTR", "CVX", "CMG", "CB", "CHD", "CI",
+    "CINF", "CTAS", "CSCO", "C", "CFG", "CLX", "CME", "CMS", "KO", "CTSH", "CL", "CMCSA", "CMA",
+    "CAG", "COP", "ED", "STZ", "CEG", "COO", "CPRT", "GLW", "CPAY", "CTVA", "CSGP", "COST", "CTRA",
+    "CCI", "CSX", "CMI", "CVS", "DHR", "DRI", "DVA", "DAY", "DECK", "DE", "DAL", "DVN", "DXCM", "FANG",
+    "DLR", "DFS", "DG", "DLTR", "D", "DPZ", "DOV", "DOW", "DHI", "DTE", "DUK", "DD", "EMN", "ETN",
+    "EBAY", "ECL", "EIX", "EW", "EA", "ELV", "EMR", "ENPH", "ETR", "EOG", "EPAM", "EQT", "EFX", "EQIX",
+    "EQR", "ESS", "EL", "EG", "EVRG", "ES", "EXC", "EXPE", "EXPD", "EXR", "XOM", "FFIV", "FDS", "FICO",
+    "FAST", "FRT", "FDX", "FIS", "FITB", "FSLR", "FE", "FI", "FMC", "F", "FTNT", "FTV", "FOXA", "FOX",
+    "BEN", "FCX", "GRMN", "IT", "GEHC", "GEV", "GEN", "GNRC", "GD", "GE", "GIS", "GM", "GPC", "GILD",
+    "GPN", "GL", "GDDY", "GS", "HAL", "HIG", "HAS", "HCA", "DOC", "HSIC", "HSY", "HES", "HPE", "HLT",
+    "HOLX", "HD", "HON", "HRL", "HST", "HWM", "HPQ", "HUBB", "HUM", "HBAN", "HII", "IBM", "IEX", "IDXX",
+    "ITW", "ILMN", "INCY", "IR", "PODD", "INTC", "ICE", "IFF", "IP", "IPG", "INTU", "ISRG", "IVZ",
+    "INVH", "IQV", "IRM", "JBHT", "JBL", "JKHY", "J", "JNJ", "JCI", "JPM", "JNPR", "K", "KVUE", "KDP",
+    "KEY", "KEYS", "KMB", "KIM", "KMI", "KLAC", "KHC", "KR", "LHX", "LH", "LRCX", "LW", "LVS", "LDOS",
+    "LEN", "LII", "LLY", "LIN", "LYV", "LKQ", "LMT", "L", "LOW", "LULU", "LYB", "MTB", "MPC", "MKTX",
+    "MAR", "MMC", "MLM", "MAS", "MA", "MTCH", "MKC", "MCD", "MCK", "MDT", "MRK", "META", "MET", "MTD",
+    "MGM", "MCHP", "MU", "MSFT", "MAA", "MRNA", "MHK", "MOH", "TAP", "MDLZ", "MPWR", "MNST", "MCO",
+    "MS", "MOS", "MSI", "MSCI", "NDAQ", "NTAP", "NFLX", "NEM", "NWSA", "NWS", "NEE", "NKE", "NI", "NDSN",
+    "NSC", "NTRS", "NOC", "NCLH", "NRG", "NUE", "NVDA", "NVR", "NXPI", "ORLY", "OXY", "ODFL", "OMC",
+    "ON", "OKE", "ORCL", "OTIS", "PCAR", "PKG", "PLTR", "PANW", "PARA", "PH", "PAYX", "PAYC", "PYPL",
+    "PNR", "PEP", "PFE", "PCG", "PM", "PSX", "PNW", "PNC", "POOL", "PPG", "PPL", "PFG", "PG", "PGR",
+    "PLD", "PRU", "PEG", "PTC", "PSA", "PHM", "QRVO", "PWR", "QCOM", "DGX", "RL", "RJF", "RTX", "O",
+    "REG", "REGN", "RF", "RSG", "RMD", "RVTY", "ROK", "ROL", "ROP", "ROST", "RCL", "SPGI", "CRM", "SBAC",
+    "SLB", "STX", "SRE", "NOW", "SHW", "SPG", "SWKS", "SJM", "SW", "SNA", "SOLV", "SO", "LUV", "SWK",
+    "SBUX", "STT", "STLD", "STE", "SYK", "SMCI", "SYF", "SNPS", "SYY", "TMUS", "TROW", "TTWO", "TPR",
+    "TRGP", "TGT", "TEL", "TDY", "TFX", "TER", "TSLA", "TXN", "TPL", "TXT", "TMO", "TJX", "TSCO", "TT",
+    "TDG", "TRV", "TRMB", "TFC", "TYL", "TSN", "USB", "UBER", "UDR", "ULTA", "UNP", "UAL", "UPS", "URI",
+    "UNH", "UHS", "VLO", "VTR", "VLTO", "VRSN", "VRSK", "VZ", "VRTX", "VTRS", "VICI", "V", "VST", "VMC",
+    "WRB", "GWW", "WAB", "WBA", "WMT", "DIS", "WBD", "WM", "WAT", "WEC", "WFC", "WELL", "WST", "WDC",
+    "WY", "WMB", "WTW", "WYNN", "XEL", "XYL", "YUM", "ZBRA", "ZBH", "ZTS",
+)
+
+# A small watchlist that earns a Focus Priority bonus — names you want surfaced
+# even on a quieter day. Tune freely (these are just examples).
+WATCHLIST = {"NVDA", "MU", "AMD", "AVGO", "TSM", "ASML", "SMCI", "PLTR", "META", "AMZN", "MSFT"}
+
+_TREND_LABEL = {
+    "Confirmed multi-day trend": ("CONFIRMED TREND", "#2F6B4F"),
+    "Quiet steady trend": ("QUIET TREND", "#3D6B52"),
+    "Possible reversal": ("POSSIBLE REVERSAL", "#B07A2E"),
+    "Fresh move — needs confirmation": ("FRESH MOVE", "#7A7970"),
+    "Noise / low priority": ("NOISE", "#A0A099"),
+}
+
+
+def _pctret(a, b):
+    return ((a - b) / b * 100.0) if (a is not None and b not in (None, 0)) else None
+
+
+def _scan_metrics(df):
+    """From a price/volume history frame, compute the movement metrics used to
+    classify and score. Returns None if there isn't enough history."""
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
+    if len(closes) < 21:
+        return None
+    last = closes[-1]
+
+    def ret(n):
+        return _pctret(last, closes[-1 - n]) if len(closes) > n else None
+
+    r1, r3, r5, r20 = ret(1), ret(3), ret(5), ret(20)
+    # Move over the 4 days ending YESTERDAY — i.e. the trend that was in place
+    # before today. This is what separates a sustained move (prior move already
+    # underway) from a one-day spike (flat before, jumped today).
+    r_prior = _pctret(closes[-2], closes[-6]) if len(closes) >= 6 else None
+    ma50 = sum(closes[-50:]) / min(50, len(closes))
+    vs_ma50 = _pctret(last, ma50)
+    win = closes[-60:]
+    hi, lo = max(win), min(win)
+    dist_high = _pctret(last, hi)   # <= 0: how far below the recent high
+    dist_low = _pctret(last, lo)    # >= 0: how far above the recent low
+    vol_ratio = None
+    if "volume" in df.columns:
+        vols = [x for x in pd.to_numeric(df["volume"], errors="coerce").tolist() if x is not None]
+        if len(vols) >= 21:
+            avg20 = sum(vols[-21:-1]) / 20
+            vol_ratio = (vols[-1] / avg20) if avg20 else None
+    return dict(price=last, r1=r1, r3=r3, r5=r5, r20=r20, r_prior=r_prior, vs_ma50=vs_ma50,
+                dist_high=dist_high, dist_low=dist_low, vol_ratio=vol_ratio)
+
+
+def _sgn(x):
+    return 0 if not x else (1 if x > 0 else -1)
+
+
+def _classify(m):
+    r3, r5, r20 = m["r3"], m["r5"], m["r20"]
+    r1, rp = m["r1"], m["r_prior"]
+    vr = m["vol_ratio"] or 1.0
+    vs = m["vs_ma50"] or 0.0
+    a1, a3, a20, ap = abs(r1 or 0), abs(r3 or 0), abs(r20 or 0), abs(rp or 0)
+    up = (r20 or 0) > 0
+    # Fresh move: a real move TODAY that the prior days don't back up — either
+    # there was no prior trend (ap small) or today dominates the whole 20-day
+    # move. This is what catches one-day spikes.
+    if a1 >= 4 and (ap < 2 or a1 >= 0.6 * a20):
+        return "Fresh move — needs confirmation"
+    # Confirmed multi-day trend: a strong 20-day move that is SPREAD across days
+    # (today is only a fraction of it), with the week agreeing on direction and
+    # price on the right side of its 50-day average.
+    if a20 >= 6 and a1 < 0.6 * a20 and _sgn(r5) == _sgn(r20) and (
+            (up and vs > 0) or ((not up) and vs < 0)):
+        return "Confirmed multi-day trend"
+    # Possible reversal: an established 20-day trend with the last few days turning.
+    if a20 >= 5 and a3 >= 3 and _sgn(r3) != _sgn(r20):
+        return "Possible reversal"
+    # Quiet steady trend: a milder, calm, consistent drift on normal volume.
+    if a20 >= 3 and a1 < 2 and vr < 1.5 and _sgn(r5) == _sgn(r20):
+        return "Quiet steady trend"
+    return "Noise / low priority"
+
+
+def _clampf(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _focus_score(m, trend, symbol):
+    r1, r20 = m["r1"] or 0, m["r20"] or 0
+    rp = m["r_prior"] or 0
+    vr = m["vol_ratio"] or 1.0
+    a1, ap, a20 = abs(r1), abs(rp), abs(r20)
+    score = 0.0
+    # confirmation rewards movement ALREADY underway before today (a sustained
+    # trend), not today's pop alone.
+    score += _clampf(ap, 0, 12) * 2.0     # multi-day confirmation (core) -> up to 24
+    score += _clampf(a20, 0, 30) * 1.0    # 20-day trend context          -> up to 30
+    score += _clampf(a1, 0, 8) * 1.0      # 1-day move (modest)           -> up to 8
+    if vr >= 2.0:                         # volume confirmation
+        score += 12
+    elif vr >= 1.5:
+        score += 8
+    elif vr >= 1.2:
+        score += 4
+    score += {"Confirmed multi-day trend": 15, "Quiet steady trend": 10,   # trend quality
+              "Possible reversal": 6, "Fresh move — needs confirmation": 4,
+              "Noise / low priority": 0}[trend]
+    if symbol in WATCHLIST:               # watchlist bonus
+        score += 8
+    if a1 >= 5 and ap < 2:                # one-day-spike penalty (no prior trend)
+        score -= 15
+    return max(0, round(score))
+
+
+def _why_explore(m, trend):
+    r1, r3, r5, r20, vr = m["r1"], m["r3"], m["r5"], m["r20"], m["vol_ratio"]
+    vtxt = f" on {vr:.1f}\u00d7 its usual volume" if (vr and vr >= 1.3) else ""
+
+    def s(x):
+        return f"{x:+.1f}%" if x is not None else "n/a"
+
+    if trend == "Confirmed multi-day trend":
+        return (f"{s(r20)} over 20 days and still moving ({s(r5)} this week){vtxt} — a sustained "
+                "trend, not a one-day pop.")
+    if trend == "Possible reversal":
+        return (f"{s(r20)} over 20 days but turning lately ({s(r3)} over 3 days) — a possible turn "
+                "worth a closer look.")
+    if trend == "Fresh move — needs confirmation":
+        return (f"Moved {s(r1)} today{vtxt}, but the week ({s(r5)}) hasn't confirmed it yet — watch "
+                "whether it holds.")
+    if trend == "Quiet steady trend":
+        return (f"Grinding {s(r20)} over 20 days in small, steady steps — the kind of trend that "
+                "rarely shows up on a top-gainers list.")
+    return f"{s(r1)} today, {s(r5)} this week — mixed signals, lower priority."
+
+
+@st.cache_data(ttl=21600, show_spinner=False)   # ~6h; keyed on the date -> recomputes daily
+def _run_daily_scan(date_str, universe):
+    import time as _t
+    rows = []
+    for sym in universe:
+        try:
+            df = get_price_history(sym, start_days=130)
+        except Exception:  # noqa: BLE001
+            df = None
+        m = _scan_metrics(df)
+        if not m:
+            continue
+        trend = _classify(m)
+        rows.append({"symbol": sym, "trend": trend,
+                     "score": _focus_score(m, trend, sym), "m": m})
+        _t.sleep(0.03)   # gentle throttle to stay under the 300/min Starter cap
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    top = rows[:20]
+    for r in top:      # company names for the top 20 only (cheap)
+        prof = get_company_profile(r["symbol"])
+        r["name"] = prof.get("name") or r["symbol"]
+        r["why"] = _why_explore(r["m"], r["trend"])
+    return top, len(rows)
+
+
+def _delta_html(v, label):
+    if v is None:
+        return (f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
+                f"text-transform:uppercase'>{label}</div><div style='color:{MUTED}'>\u2014</div>")
+    color = POS if v >= 0 else NEG
+    return (f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
+            f"text-transform:uppercase'>{label}</div>"
+            f"<div style='color:{color};font-weight:600;font-size:1.02rem'>{v:+.1f}%</div>")
+
+
+def render_top_stocks():
+    import datetime as _dt
+    section("Top Stocks to Explore", "your morning starting point")
+    st.caption("A daily scan of the S&P 500 for stocks with **confirmed multi-day movement** — not "
+               "one-day spikes or penny-stock noise. Ranked by a Focus Priority score that rewards "
+               "moves that hold up across days and come with real volume. The first load each day "
+               "scans ~500 names and takes a minute or two; after that it's cached and instant.")
+    today = _dt.date.today()
+    with st.spinner("Scanning the S&P 500 for today's trends\u2026  (first load of the day only)"):
+        top, scanned = _run_daily_scan(today.isoformat(), SP500)
+
+    if not top:
+        st.info("Nothing to show yet. If this is the very first load it may still be warming up, or "
+                "price history is briefly unavailable — try again in a moment.")
+        return
+
+    st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 showing the top {len(top)} "
+               "by Focus Priority.")
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
+                unsafe_allow_html=True)
+
+    for i, r in enumerate(top, 1):
+        m = r["m"]
+        c = st.columns([3.4, 1.15, 1.15, 1.15, 1.0, 0.95])
+        with c[0]:
+            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}</div>"
+                        f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>",
+                        unsafe_allow_html=True)
+        with c[1]:
+            st.markdown(_delta_html(m["r1"], "Today"), unsafe_allow_html=True)
+        with c[2]:
+            st.markdown(_delta_html(m["r5"], "5D"), unsafe_allow_html=True)
+        with c[3]:
+            st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
+        with c[4]:
+            vr = m["vol_ratio"]
+            vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
+            vcol = POS if (vr and vr >= 1.3) else MUTED
+            st.markdown(f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
+                        f"text-transform:uppercase'>Vol</div>"
+                        f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
+                        unsafe_allow_html=True)
+        with c[5]:
+            st.button("View \u2192", key=f"top_{r['symbol']}", use_container_width=True,
+                      on_click=_view_stock, args=(r["symbol"],))
+
+        label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
+        b = st.columns([5.0, 1.0])
+        with b[0]:
+            st.markdown(
+                f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
+                f"text-transform:uppercase'>{label}</span>"
+                f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
+                unsafe_allow_html=True)
+        with b[1]:
+            st.markdown(
+                f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
+                f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
+                f"<span style='font-weight:700;font-size:1.1rem;color:{INK}'>{r['score']}</span></div>",
+                unsafe_allow_html=True)
+        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
+                    unsafe_allow_html=True)
+
+    st.caption("Focus Priority weighs multi-day confirmation, 20-day trend, volume, and trend "
+               "quality, with a penalty for one-day spikes. It's a starting point for research, not "
+               "a signal to trade \u2014 open any name to dig into the fundamentals and decide for "
+               "yourself.")
+
+
+
 def show_ticker(symbol):
     symbol = symbol.upper().strip()
 
@@ -3040,11 +3332,21 @@ def _view_compare():
     st.session_state.view = {"kind": "compare"}
 
 
+def _view_top():
+    st.session_state.view = {"kind": "top"}
+
+
 # on_click callbacks (below) run at the start of the rerun, before this body,
 # so `view` already reflects the button the person just clicked — no stale state.
 view = st.session_state.get("view", {"kind": "movers", "mover": "gainers"})
 active_mover = view.get("mover") if view.get("kind") == "movers" else None
 on_compare = view.get("kind") == "compare"
+
+# --- Daily starting point ---
+st.sidebar.button("\u2600\ufe0f  Top Stocks to Explore", use_container_width=True,
+                  type="primary" if view.get("kind") == "top" else "secondary",
+                  on_click=_view_top)
+st.sidebar.markdown("---")
 
 # --- Search ---
 search_term = st.sidebar.text_input("🔎 Search company or ticker",
@@ -3109,6 +3411,8 @@ if view.get("kind") == "stock":
     show_ticker(view["symbol"])
 elif view.get("kind") == "compare":
     show_comparison()
+elif view.get("kind") == "top":
+    render_top_stocks()
 else:
     show_movers(view.get("mover", "gainers"))
 
