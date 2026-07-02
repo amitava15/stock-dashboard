@@ -22,6 +22,11 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layout="wide")
 
+# App version — bump this on every change so you can confirm what's actually
+# deployed. It shows in the sidebar footer and the page footer.
+APP_VERSION = "0.9.1"
+APP_BUILD = "2026-07-02"
+
 # ---------------------------------------------------------------------------
 # Styling: quiet editorial "tasting card" — serif values like menu prices,
 # letter-spaced labels like menu sections, hairline rules between courses.
@@ -3050,6 +3055,9 @@ st.sidebar.button("Compare stocks  →", use_container_width=True,
                   type="primary" if on_compare else "secondary",
                   on_click=_view_compare)
 
+st.sidebar.markdown("---")
+st.sidebar.caption(f"📦 Version {APP_VERSION} · {APP_BUILD}")
+
 st.title("Stock Research Dashboard")
 
 if not FMP_KEY:
@@ -3075,3 +3083,4 @@ st.caption(
     "and may be delayed. Metrics and 'healthy ranges' are general guidance — compare within a "
     "company's own industry, and make your own decisions."
 )
+st.caption(f"📦 Version {APP_VERSION} · built {APP_BUILD}")
