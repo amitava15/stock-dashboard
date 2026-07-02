@@ -1004,7 +1004,7 @@ def _trend_chart(years, values, fmt):
     # Solid near-black against the dotted light gridlines; only drawn when a
     # value actually crosses zero, so its mere presence signals "went negative".
     if lo < 0:
-        fig.add_hline(y=0, line=dict(color=INK, width=2))
+        fig.add_hline(y=0, line=dict(color=INK, width=1.25))
     return fig
 
 
@@ -1685,14 +1685,27 @@ _STOCK_PAGE_CSS = """
 /* tabs: editorial look, and sticky so navigation stays reachable while scrolling */
 div[data-testid="stTabs"] div[data-baseweb="tab-list"]{
   position:sticky;top:0;z-index:50;background:var(--paper,#FCFBF8);
-  border-bottom:1px solid var(--line,#E8E6DE);gap:.4rem;padding-top:.35rem;margin-bottom:.5rem}
+  border-bottom:1px solid var(--line,#E8E6DE);gap:1.7rem;padding-top:.35rem;margin-bottom:.5rem}
 div[data-testid="stTabs"] button[data-baseweb="tab"]{
-  background:transparent;padding:.55rem .1rem;font-family:'IBM Plex Sans',sans-serif;
+  background:transparent;padding:.55rem .15rem;font-family:'IBM Plex Sans',sans-serif;
   font-size:.72rem;font-weight:600;letter-spacing:.13em;text-transform:uppercase;
   color:var(--muted,#7A7970)}
 div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]{color:var(--ink,#23231E)}
 div[data-testid="stTabs"] div[data-baseweb="tab-highlight"]{background-color:var(--ink,#23231E)}
 div[data-testid="stTabs"] div[data-baseweb="tab-border"]{background-color:transparent}
+
+/* Floating PDF button(s) — reachable from any tab. Bottom-LEFT to avoid
+   Streamlit Cloud's bottom-right "Manage app" badge. */
+.st-key-pdf_fab_gen,.st-key-pdf_fab_dl{position:fixed;left:18px;z-index:1000;width:auto}
+.st-key-pdf_fab_gen{bottom:18px}
+.st-key-pdf_fab_dl{bottom:64px}
+.st-key-pdf_fab_gen button,.st-key-pdf_fab_dl button{
+  width:auto;border-radius:999px;padding:.5rem 1rem;font-family:'IBM Plex Sans',sans-serif;
+  font-weight:600;font-size:.78rem;letter-spacing:.02em;box-shadow:0 3px 12px rgba(35,35,30,.20)}
+.st-key-pdf_fab_gen button{background:var(--ink,#23231E);color:var(--paper,#FCFBF8);
+  border:1px solid var(--ink,#23231E)}
+.st-key-pdf_fab_dl button{background:var(--paper,#FCFBF8);color:var(--ink,#23231E);
+  border:1px solid var(--ink,#23231E)}
 </style>
 """
 
@@ -1816,7 +1829,7 @@ def _pdf_trend(ax, years, values, fmt):
         ax.annotate(lab(v), (xi, v), textcoords="offset points",
                     xytext=(0, 5 if v >= 0 else -11), ha="center", fontsize=6.5, color=INK)
     if lo < 0:
-        ax.axhline(0, color=INK, lw=1.3, zorder=2)
+        ax.axhline(0, color=INK, lw=0.9, zorder=2)
     ax.set_xticks(x)
     ax.set_xticklabels(xs, fontsize=6.5, color=MUTED)
     ax.set_yticks([])
@@ -2121,15 +2134,18 @@ def build_pdf_report(symbol):
     return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes)
 
 
-def render_pdf_export(symbol):
+def render_pdf_fab(symbol):
+    """Floating 'Generate / Download PDF' control, pinned on-screen so it's
+    reachable from any tab (positioned via CSS in _STOCK_PAGE_CSS). Sits
+    bottom-left to steer clear of Streamlit Cloud's bottom-right 'Manage app'
+    badge. If reportlab/matplotlib aren't installed yet, nothing floats — the
+    Notes tab explains why."""
     if not _PDF_OK:
-        st.caption("PDF export needs the **reportlab** and **matplotlib** packages — add them to "
-                   "`requirements.txt` and redeploy, and this button will appear.")
         return
-    st.caption("Save this stock's full research — every tab, charts included — as a PDF. "
-               "Tip: generate the AI analysis and jot your notes first, and they'll be included.")
     cache = st.session_state.setdefault("pdf_cache", {})
-    if st.button("\U0001F4C4 Generate PDF report", key=f"pdfgen_{symbol}"):
+    if st.button("\U0001F4C4 PDF", key="pdf_fab_gen",
+                 help="Build a PDF of this stock — every tab, charts included. Generate the AI "
+                      "analysis and write your notes first if you want them in the report."):
         with st.spinner("Building your report…"):
             try:
                 cache[symbol] = build_pdf_report(symbol)
@@ -2137,9 +2153,9 @@ def render_pdf_export(symbol):
                 cache.pop(symbol, None)
                 st.error(f"Couldn't build the PDF: {e}")
     if cache.get(symbol):
-        st.download_button("\u2B07\uFE0F Download PDF", data=cache[symbol],
+        st.download_button("\u2B07 Save", data=cache[symbol],
                            file_name=f"{symbol}_research_{_dt.date.today():%Y%m%d}.pdf",
-                           mime="application/pdf", key=f"pdfdl_{symbol}")
+                           mime="application/pdf", key="pdf_fab_dl")
 
 
 
@@ -2164,6 +2180,7 @@ def show_ticker(symbol):
 
     st.markdown(_STOCK_PAGE_CSS, unsafe_allow_html=True)
     _render_stock_header(symbol, name, industry, exchange, quote)
+    render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
 
     tab_overview, tab_business, tab_valuation, tab_market, tab_notes = st.tabs(
         ["Overview", "Business", "Valuation", "Market", "Notes"]
@@ -2243,10 +2260,9 @@ def show_ticker(symbol):
                                  "multiples — is the growth already priced in? Check next earnings before deciding.")
         st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics "
                    "(PEG, EV/EBITDA) may show N/A on the current data tier — the app stays fully usable without them.")
-
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        section("Export", "take it with you")
-        render_pdf_export(symbol)
+        if not _PDF_OK:
+            st.caption("📄 PDF export needs the **reportlab** and **matplotlib** packages — add them to "
+                       "`requirements.txt` and redeploy, and a floating **PDF** button appears bottom-left.")
 
 
 # ===========================================================================
