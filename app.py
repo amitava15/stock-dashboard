@@ -619,17 +619,41 @@ def show_ticker(symbol):
 SERIES_COLORS = ["#23231E", "#2F6B4F", "#A24A38", "#3A5A78", "#8A6D3B", "#6B4E71"]
 
 
-def _parse_tickers(raw, cap=5):
-    """Split a free-text field ('NVDA, amd; avgo') into clean, de-duped symbols."""
-    seen, out = set(), []
-    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
-        t = chunk.strip().upper()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-        if len(out) >= cap:
-            break
-    return out
+def _resolve_symbol(query):
+    """Resolve a typed name or ticker to (SYMBOL, name). Exact ticker wins;
+    otherwise take the best search match; otherwise treat the input as a ticker."""
+    q = query.strip()
+    qU = q.upper()
+    matches = search_companies(q) or []
+    for m in matches:                                   # exact ticker match first
+        if (m.get("symbol") or "").upper() == qU:
+            return qU, m.get("name")
+    if matches:                                         # else best-ranked match
+        m0 = matches[0]
+        return (m0.get("symbol") or qU).upper(), m0.get("name")
+    return qU, None                                     # else assume it's a ticker
+
+
+def _cmp_add():
+    """Add-button / Enter callback: resolve the box and append a chip (max 5)."""
+    q = st.session_state.get("cmp_add_box", "").strip()
+    st.session_state.cmp_add_box = ""                   # clear the box
+    if not q:
+        return
+    lst = st.session_state.setdefault("cmp_list", [])
+    if len(lst) >= 5:
+        return
+    sym, name = _resolve_symbol(q)
+    if sym and all(item["sym"] != sym for item in lst):
+        lst.append({"sym": sym, "name": name})
+        st.session_state.cmp_last_added = f"{sym} — {name}" if name else sym
+
+
+def _cmp_remove(sym):
+    """Chip-click callback: drop that ticker from the comparison set."""
+    st.session_state.cmp_list = [
+        i for i in st.session_state.get("cmp_list", []) if i["sym"] != sym
+    ]
 
 
 def _rebased_series(symbol, days):
@@ -727,19 +751,51 @@ def _metrics_column(symbol):
 
 def show_comparison():
     section("Compare", "side by side")
-    st.caption("Enter 2–5 tickers to see relative performance and fundamentals side by side. "
-               "**You** decide what the differences mean.")
+    st.caption("Build a set of 2–5 companies to see relative performance and fundamentals "
+               "side by side. **You** decide what the differences mean.")
 
-    default = st.session_state.get("last_symbol", "")
-    raw = st.text_input("Tickers to compare (comma-separated)",
-                        value=st.session_state.get("cmp_tickers", default),
-                        key="cmp_tickers",
-                        placeholder="e.g.  NVDA, AMD, AVGO, INTC")
+    # Seed once from the last stock you viewed (if any).
+    if not st.session_state.get("cmp_init"):
+        seed = st.session_state.get("last_symbol")
+        if seed:
+            s_sym, s_name = _resolve_symbol(seed)
+            st.session_state.cmp_list = [{"sym": s_sym, "name": s_name}]
+        st.session_state.cmp_init = True
+
+    lst = st.session_state.setdefault("cmp_list", [])
+    at_cap = len(lst) >= 5
+
+    # --- Add a company or ticker (one at a time) ---
+    st.markdown("**Add a company or ticker**")
+    c_in, c_btn = st.columns([5, 1])
+    with c_in:
+        st.text_input("Add", key="cmp_add_box", label_visibility="collapsed",
+                      placeholder="e.g.  Amazon   or   AMZN",
+                      on_change=_cmp_add, disabled=at_cap)
+    with c_btn:
+        st.button("Add", use_container_width=True, on_click=_cmp_add, disabled=at_cap)
+
+    added = st.session_state.pop("cmp_last_added", None)
+    if added:
+        st.caption(f"Added **{added}**.")
+    if at_cap:
+        st.caption("That's the maximum of 5 — remove one to add another.")
+
+    # --- Selected companies as removable chips ---
+    if lst:
+        st.caption("Comparing (tap to remove):")
+        cols = st.columns(6)
+        for i, item in enumerate(lst):
+            with cols[i]:
+                st.button(f"{item['sym']}  ✕", key=f"chip_{item['sym']}",
+                          help=f"Remove {item.get('name') or item['sym']}",
+                          on_click=_cmp_remove, args=(item["sym"],))
+
     include_spy = st.checkbox("Compare price to the S&P 500 (SPY)", value=True, key="cmp_spy")
 
-    tickers = _parse_tickers(raw, cap=5)
+    tickers = [item["sym"] for item in lst]
     if not tickers:
-        st.info("Enter at least one ticker above to get started — e.g. **NVDA, AMD, AVGO**.")
+        st.info("Add at least one company above to get started — e.g. **Amazon** or **AMZN**.")
         return
 
     # ---- Relative performance chart ----
