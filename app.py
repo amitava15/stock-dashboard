@@ -817,7 +817,8 @@ def render_trajectory(symbol):
             if fig is None:
                 st.caption("Unavailable from current data source.")
             else:
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False}, key=f"traj_{symbol}_{key}")
 
     _subgroup("Growth")
     c1, c2 = st.columns(2)
@@ -871,7 +872,8 @@ def render_cash_generation(symbol):
             if fig is None:
                 st.caption("Unavailable from current data source.")
             else:
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False}, key=f"cash_{symbol}_{key}")
 
     c1, c2 = st.columns(2)
     cell(c1, "Free Cash Flow", "fcf", "money")
