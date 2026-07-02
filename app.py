@@ -668,6 +668,36 @@ def get_quarterly_trend(symbol, n=6):
     return _parse_quarterly(inc, cf, n)
 
 
+def get_forward_estimates(symbol, n=3):
+    """Next n fiscal years of consensus revenue + EPS estimates (nearest future
+    first), each with a forward P/E (current price / estimated EPS). Source is
+    analyst-estimates (annual); empty list if the endpoint returns nothing."""
+    import datetime as _dt
+    sym = symbol.upper()
+    rows = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12") or []
+    price = to_float(pick(_fmp_quote(sym), "price"))
+    today = _dt.date.today()
+    fut = []
+    for r in rows:
+        ds = str(r.get("date") or "")[:10]
+        try:
+            dd = _dt.date.fromisoformat(ds) if len(ds) == 10 else _dt.date(int(ds[:4]), 1, 1)
+        except (ValueError, TypeError):
+            continue
+        if dd >= today:
+            fut.append((dd, r))
+    fut.sort(key=lambda x: x[0])
+    out = []
+    for dd, r in fut[:n]:
+        eps = to_float(pick(r, "epsAvg"))
+        rev = to_float(pick(r, "revenueAvg"))
+        out.append({"fiscal_year": dd.year, "revenue": rev, "eps": eps,
+                    "forward_pe": (price / eps) if (price and eps and eps > 0) else None,
+                    "n_eps": to_float(pick(r, "numAnalystsEps")),
+                    "n_rev": to_float(pick(r, "numAnalystsRevenue"))})
+    return {"price": price, "years": out}
+
+
 def get_valuation_growth(symbol, years=6):
     """Current valuation (TTM), growth context (YoY), and each multiple vs its
     own 5-year median. Forward P/E needs analyst estimates and degrades to None
@@ -1240,6 +1270,35 @@ def render_valuation_growth(symbol):
     metric_tile(c[1], "Price / Sales", num(cur.get("ps")), "price_sales")
     metric_tile(c[2], "FCF Yield", pct(cur.get("fcf_yield")), "fcf_yield")
 
+    fe = get_forward_estimates(symbol, n=2)
+    if fe["years"]:
+        _subgroup("Forward Valuation")
+        cols = st.columns(len(fe["years"]))
+        for col, y in zip(cols, fe["years"]):
+            with col:
+                st.metric(f"FY{y['fiscal_year']} est. EPS",
+                          f"${y['eps']:,.2f}" if to_float(y.get("eps")) is not None else "N/A",
+                          help="Consensus analyst EPS estimate for this fiscal year.")
+                bits = []
+                if to_float(y.get("forward_pe")) is not None:
+                    bits.append(f"**{y['forward_pe']:.1f}×** fwd P/E")
+                if to_float(y.get("revenue")) is not None:
+                    bits.append(f"${y['revenue'] / 1e9:,.0f}B rev")
+                if bits:
+                    st.caption(" · ".join(bits))
+                if to_float(y.get("n_eps")) is not None:
+                    st.caption(f"{int(y['n_eps'])} analysts")
+        pe_ttm = to_float(cur.get("pe"))
+        fpe1 = to_float(fe["years"][0].get("forward_pe"))
+        if pe_ttm and fpe1 and fpe1 < pe_ttm * 0.85:
+            st.caption(f"Trailing P/E is **{pe_ttm:.0f}×** but forward P/E is **{fpe1:.0f}×** — the "
+                       "market expects earnings to rise sharply, so the stock looks cheaper against "
+                       "*future* profits than past ones. That read only holds if the estimates do.")
+        elif pe_ttm and fpe1 and fpe1 > pe_ttm * 1.15:
+            st.caption(f"Trailing P/E is **{pe_ttm:.0f}×** but forward P/E is **{fpe1:.0f}×** — "
+                       "earnings are expected to fall, so the stock is more expensive against future "
+                       "profits than trailing ones suggest.")
+
     _subgroup("Growth Context")
     c = st.columns(3)
     metric_tile(c[0], "Revenue Growth (YoY)", pct(gro.get("revenue")), "revenue_growth")
@@ -1801,6 +1860,7 @@ def _analysis_json(symbol):
     nxt, last = ea.get("next") or {}, ea.get("last") or {}
     ql = get_quarterly_trend(symbol)
     qm = ql["metrics"]
+    fe = get_forward_estimates(symbol, n=3)
     dq = compute_quality_flags(symbol)
 
     def rnd(v, nd=2):
@@ -1882,6 +1942,17 @@ def _analysis_json(symbol):
             "revenue": rnd(gro.get("revenue")),
             "eps": rnd(gro.get("eps")),
             "fcf": rnd(gro.get("fcf")),
+        },
+        "forward_estimates": {
+            "note": "consensus analyst estimates for upcoming fiscal years; forward_pe = current price / estimated EPS",
+            "years": [
+                {"fiscal_year": y["fiscal_year"],
+                 "revenue_billions": round(y["revenue"] / 1e9, 1) if to_float(y["revenue"]) is not None else None,
+                 "eps": round(y["eps"], 2) if to_float(y["eps"]) is not None else None,
+                 "forward_pe": round(y["forward_pe"], 1) if to_float(y["forward_pe"]) is not None else None,
+                 "analysts_eps": int(y["n_eps"]) if to_float(y["n_eps"]) is not None else None}
+                for y in fe["years"]
+            ],
         },
         "analyst_view": {
             "buy": int((to_float(g.get("strongBuy")) or 0) + (to_float(g.get("buy")) or 0)),
