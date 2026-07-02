@@ -1584,6 +1584,50 @@ Before writing the final summary, check the data for anomalies:
 If there are anomalies, include a short "Data quality notes" section before the recommendation."""
 
 
+# A short, cheap variant — a fraction of the output tokens of the full report.
+ANALYSIS_TEMPLATE_QUICK = """Input data:
+{STOCK_DATA}
+
+Write a CONCISE plain-English research summary for {TICKER} — aim for roughly 400-600 words total,
+tight and skimmable. Use exactly this structure:
+
+# {TICKER} — Quick Research Take
+
+## Bottom line
+2-3 sentences: research stance (Buyable / Hold / Watchlist / Avoid for now), confidence
+(Low / Medium / High), and the single main reason.
+
+## The business
+1-2 sentences on what it does and whether it's cyclical, stable, or high-growth.
+
+## Trajectory & cash
+2-3 sentences: are revenue, margins, and free cash flow improving or deteriorating? Flag any loss
+years or unusually heavy capex (earnings much larger than free cash flow).
+
+## Valuation
+2-3 sentences: cheap / reasonable / stretched versus its own 5-year history and its growth. If PEG
+looks tiny, explain whether it's distorted by a low or negative prior-year base — do NOT call the
+stock cheap just because PEG is low.
+
+## Analysts & catalysts
+1-2 sentences: consensus lean, upside to the average price target, and the next earnings date.
+
+## Price & risk
+1-2 sentences: extended or beaten down (moving averages, RSI, distance from highs), how volatile
+(beta), and the single biggest risk.
+
+## Bull vs bear
+One line each.
+
+## Final read
+One sentence tying it together into a research view.
+
+Before the final read, if any data looks wrong, stale, or extreme (e.g. a P/E that doesn't match the
+reported EPS, or a growth rate inflated by a negative prior year), flag it in one short line. Rules:
+no personalized advice, no "you should buy/sell"; explain jargon briefly; be honest about missing or
+suspicious data."""
+
+
 def _fmt_series(years, vals, fmt):
     out = []
     for y, v in zip(years or [], vals or []):
@@ -1720,19 +1764,22 @@ def _analysis_json(symbol):
     return _json.dumps(data, indent=2)
 
 
-def generate_ai_analysis(symbol, stock_json):
+def generate_ai_analysis(symbol, stock_json, full=False):
     """Call Claude's Messages API. Returns (text, error). Uses raw HTTP so no extra
-    dependency is needed. Reads the key from Streamlit secrets."""
+    dependency is needed. Reads the key from Streamlit secrets. `full` selects the
+    long detailed report; otherwise a short, much cheaper quick take."""
     key = st.secrets.get("ANTHROPIC_API_KEY", "")
     if not key:
         return None, "no_key"
-    user_msg = ANALYSIS_TEMPLATE.replace("{STOCK_DATA}", stock_json).replace("{TICKER}", symbol)
+    template = ANALYSIS_TEMPLATE if full else ANALYSIS_TEMPLATE_QUICK
+    max_out = 16000 if full else 2000
+    user_msg = template.replace("{STOCK_DATA}", stock_json).replace("{TICKER}", symbol)
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": ANTHROPIC_MODEL, "max_tokens": 8000,
+            json={"model": ANTHROPIC_MODEL, "max_tokens": max_out,
                   "system": ANALYSIS_SYSTEM,
                   "messages": [{"role": "user", "content": user_msg}]},
             timeout=150,
@@ -1754,6 +1801,23 @@ def generate_ai_analysis(symbol, stock_json):
         return None, str(e)
 
 
+AI_REPORT_CSS = """<style>
+/* AI analysis: simple document look — 14pt headers, 12pt body, sans, no italics */
+.st-key-ai_report h1, .st-key-ai_report h2, .st-key-ai_report h3, .st-key-ai_report h4 {
+  font-family:'IBM Plex Sans', system-ui, sans-serif !important;
+  font-weight:600 !important; font-style:normal !important;
+  font-size:14pt !important; line-height:1.25 !important;
+  letter-spacing:0 !important; text-transform:none !important;
+  margin:1rem 0 .4rem !important; color:var(--ink,#23231E) !important; }
+.st-key-ai_report p, .st-key-ai_report li {
+  font-family:'IBM Plex Sans', system-ui, sans-serif !important;
+  font-size:12pt !important; font-style:normal !important;
+  line-height:1.5 !important; color:var(--ink,#23231E) !important; }
+.st-key-ai_report em, .st-key-ai_report i, .st-key-ai_report code { font-style:normal !important; }
+.st-key-ai_report strong, .st-key-ai_report b { font-weight:600 !important; }
+</style>"""
+
+
 def render_ai_analysis(symbol):
     if not st.secrets.get("ANTHROPIC_API_KEY", ""):
         st.info(
@@ -1765,16 +1829,23 @@ def render_ai_analysis(symbol):
         )
         return
 
-    st.caption("Claude reads all the data on this stock and writes a structured, plain-English "
-               "research summary — what each metric means, whether the business is improving, "
-               "whether the valuation is demanding, and a bull/bear framework. It gives a research "
-               "*view* (e.g. Buyable / Hold / Watchlist / Avoid), not personalized advice. "
-               "Educational only. Each run is a detailed report, so it costs a bit more API usage "
-               "than a short answer — typically a few cents.")
+    st.caption("Claude reads all the data on this stock and writes a plain-English research "
+               "summary — what each metric means, whether the business is improving, whether the "
+               "valuation is demanding, and a bull/bear framework. It gives a research view "
+               "(e.g. Buyable / Hold / Watchlist / Avoid), not personalized advice. Educational only.")
+    depth = st.radio(
+        "Report depth", ["Quick take", "Full report"], horizontal=True, key=f"ai_depth_{symbol}",
+        captions=["Short & skimmable — roughly 1–3¢ per run",
+                  "All 11 sections in depth — roughly 10–15¢ per run"],
+    )
+    full = depth == "Full report"
+    st.caption("Want it cheaper still? Set `ANTHROPIC_MODEL = \"claude-haiku-4-5-20251001\"` in your "
+               "secrets — Haiku is about 3× cheaper than the default. You can also set a monthly "
+               "spend cap in the Anthropic Console.")
     cache = st.session_state.setdefault("ai_analysis", {})
     if st.button("✨ Generate AI analysis", key=f"ai_btn_{symbol}"):
-        with st.spinner("Claude is reading the data and writing the report…"):
-            text, err = generate_ai_analysis(symbol, _analysis_json(symbol))
+        with st.spinner("Claude is writing the full report…" if full else "Claude is reading the data…"):
+            text, err = generate_ai_analysis(symbol, _analysis_json(symbol), full=full)
         if err:
             st.error(f"Analysis failed ({err}). Check the API key, and if it mentions the model, "
                      "set `ANTHROPIC_MODEL` in your secrets to a current model name.")
@@ -1782,8 +1853,13 @@ def render_ai_analysis(symbol):
             cache[symbol] = text
 
     if cache.get(symbol):
-        st.markdown(cache[symbol])
-        st.caption("⚠️ AI-generated research view for education — **not** personalized financial "
+        st.markdown(AI_REPORT_CSS, unsafe_allow_html=True)
+        # Escape "$" so Streamlit doesn't read "$...$" as LaTeX math — that was
+        # italicising and garbling the dollar figures.
+        clean = cache[symbol].replace("$", "\\$")
+        with st.container(key="ai_report"):
+            st.markdown(clean)
+        st.caption("⚠️ AI-generated research view for education — not personalized financial "
                    "advice, and it may contain errors. Any stance (Buyable / Hold / Avoid, etc.) is "
                    "a research framing, not a recommendation to act. Verify against primary sources "
                    "and make your own decision.")
@@ -2056,6 +2132,10 @@ def _pdf_styles():
         "subg": ParagraphStyle("sg", fontName=_bf(True), fontSize=7.5, textColor=HexColor(MUTED), leading=11, spaceBefore=8, spaceAfter=3),
         "lab": ParagraphStyle("l", fontName=_bf(), fontSize=7, textColor=HexColor(MUTED), leading=9),
         "val": ParagraphStyle("v", fontName=_bf(), fontSize=10, textColor=HexColor(INK), leading=13),
+        "ai_h": ParagraphStyle("aih", fontName=_bf(True), fontSize=14, textColor=HexColor(INK),
+                               leading=17, spaceBefore=10, spaceAfter=4),
+        "ai_body": ParagraphStyle("aib", fontName=_bf(), fontSize=12, textColor=HexColor(INK),
+                                  leading=16, spaceAfter=4),
     }
 
 
@@ -2240,14 +2320,23 @@ def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn,
 
     if ai_text:
         story += _pdf_section("AI Analysis", "the whole picture, in plain English", S)
+        import re as _re
+
+        def _mdclean(s):
+            s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            s = _re.sub(r"\*\*(.+?)\*\*", r"\1", s)   # bold markers
+            s = _re.sub(r"__(.+?)__", r"\1", s)
+            s = _re.sub(r"\*(.+?)\*", r"\1", s)        # italic markers (no italics)
+            return s.strip()
+
         for para in str(ai_text).split("\n"):
             p = para.strip()
             if not p:
                 continue
             if p.startswith("#"):
-                story.append(Paragraph(p.lstrip("# ").strip(), S["subg"]))
+                story.append(Paragraph(_mdclean(p.lstrip("# ").strip()), S["ai_h"]))
             else:
-                story.append(Paragraph(p.replace("**", ""), S["body"]))
+                story.append(Paragraph(_mdclean(p), S["ai_body"]))
                 story.append(Spacer(1, 3))
         story.append(Paragraph("AI-generated and may contain errors; verify against primary sources. Not a recommendation.", S["note"]))
 
