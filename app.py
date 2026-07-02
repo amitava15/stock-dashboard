@@ -440,6 +440,75 @@ def get_trajectory_annual(symbol, years=6):
     return {"years": order, "metrics": metrics}
 
 
+def get_cash_annual(symbol, years=6):
+    """Assemble annual cash-generation series: FCF, FCF margin, FCF/share, FCF
+    yield (all from the same annual statements, so the section is internally
+    consistent). Values are None where a field/endpoint is unavailable.
+    """
+    sym = symbol.upper()
+    inc = _fmp_statement(f"income-statement?symbol={sym}&period=annual&limit={years}")
+    cf = _fmp_statement(f"cash-flow-statement?symbol={sym}&period=annual&limit={years}")
+    km = _fmp_statement(f"key-metrics?symbol={sym}&period=annual&limit={years}")
+
+    def by_year(rows):
+        out = {}
+        for r in rows or []:
+            y = str(r.get("fiscalYear") or r.get("calendarYear") or "")
+            if not y and r.get("date"):
+                y = str(r["date"])[:4]
+            if y:
+                out.setdefault(y, r)
+        return out
+
+    inc_y, cf_y, km_y = by_year(inc), by_year(cf), by_year(km)
+    if not cf_y and not inc_y:
+        return {"years": [], "metrics": {}, "latest": {}}
+    order = sorted(set(list(cf_y.keys()) + list(inc_y.keys())))[-years:]
+
+    def fcf(y):
+        row = cf_y.get(y, {})
+        v = to_float(pick(row, "freeCashFlow"))
+        if v is not None:
+            return v
+        ocf = to_float(pick(row, "operatingCashFlow", "netCashProvidedByOperatingActivities"))
+        capex = to_float(pick(row, "capitalExpenditure"))
+        if ocf is None or capex is None:
+            return None
+        return ocf - abs(capex)
+
+    def fcf_margin(y):
+        f, rev = fcf(y), to_float(inc_y.get(y, {}).get("revenue"))
+        return (f / rev * 100) if (f is not None and rev not in (None, 0)) else None
+
+    def fcf_ps(y):
+        f = fcf(y)
+        sh = to_float(pick(inc_y.get(y, {}), "weightedAverageShsOutDil", "weightedAverageShsOut"))
+        return (f / sh) if (f is not None and sh not in (None, 0)) else None
+
+    def fcf_yield(y):
+        f = fcf(y)
+        mc = to_float(pick(km_y.get(y, {}), "marketCap"))
+        return (f / mc * 100) if (f is not None and mc not in (None, 0)) else None
+
+    metrics = {
+        "fcf": [fcf(y) for y in order],
+        "fcf_margin": [fcf_margin(y) for y in order],
+        "fcf_ps": [fcf_ps(y) for y in order],
+        "fcf_yield": [fcf_yield(y) for y in order],
+    }
+
+    fcf_pairs = [(y, fcf(y)) for y in order if fcf(y) is not None]
+    growth = None
+    if len(fcf_pairs) >= 2 and fcf_pairs[-2][1] not in (None, 0):
+        growth = (fcf_pairs[-1][1] - fcf_pairs[-2][1]) / abs(fcf_pairs[-2][1]) * 100
+    latest = {
+        "year": order[-1] if order else None,
+        "fcf": metrics["fcf"][-1] if metrics["fcf"] else None,
+        "fcf_growth": growth,
+    }
+    return {"years": order, "metrics": metrics, "latest": latest}
+
+
 # ===========================================================================
 # Safe field access + formatting helpers
 # ===========================================================================
@@ -645,6 +714,58 @@ def _trend_chart(years, values, fmt):
     return fig
 
 
+def _trend_bar(years, values, fmt):
+    """A small bar chart with the actual value labeled on each bar.
+    None if there are no real points. Same formats as _trend_chart."""
+    pts = [(y, v) for y, v in zip(years, values) if v is not None]
+    if len(pts) < 1:
+        return None
+    xs = [f"FY{y[2:]}" if len(y) == 4 else y for y, _ in pts]
+    ys = [v for _, v in pts]
+
+    if fmt == "money":
+        scale, unit = _money_scale(ys)
+        ys = [v / scale for v in ys]
+        labels = [f"${v:,.1f}{unit}" for v in ys]
+        tickprefix, ticksuffix, tickformat = "$", unit, ",.1f"
+    elif fmt == "pct":
+        labels = [f"{v:,.1f}%" for v in ys]
+        tickprefix, ticksuffix, tickformat = "", "%", ",.0f"
+    elif fmt in ("eps", "pershare"):
+        labels = [f"${v:,.2f}" for v in ys]
+        tickprefix, ticksuffix, tickformat = "$", "", ",.2f"
+    else:
+        labels = [f"{v:,.2f}" for v in ys]
+        tickprefix, ticksuffix, tickformat = "", "", ",.2f"
+
+    fig = go.Figure(go.Bar(
+        x=xs, y=ys, text=labels, textposition="outside", cliponaxis=False,
+        textfont=dict(family="IBM Plex Sans, sans-serif", color=INK, size=11),
+        marker=dict(color=INK),
+        hovertemplate="%{x}   %{text}<extra></extra>",
+    ))
+    lo, hi = min(ys), max(ys)
+    span = (hi - lo) or abs(hi) or 1
+    pad = span * 0.22
+    ymin = (lo - pad) if lo < 0 else 0
+    ymax = (hi + pad) if hi > 0 else pad
+    fig.update_layout(
+        height=210, margin=dict(l=6, r=6, t=14, b=6),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=11),
+        showlegend=False, bargap=0.35,
+        xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
+                   tickfont=dict(color=MUTED, size=10), fixedrange=True, type="category"),
+        yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot", showline=False,
+                   zeroline=False, ticks="", tickprefix=tickprefix, ticksuffix=ticksuffix,
+                   tickformat=tickformat, tickfont=dict(color=MUTED, size=10),
+                   range=[ymin, ymax], fixedrange=True),
+    )
+    if lo < 0:
+        fig.add_hline(y=0, line=dict(color=LINE, width=1))
+    return fig
+
+
 def _direction(vals):
     pts = [v for v in (vals or []) if v is not None]
     if len(pts) < 2 or pts[0] == 0:
@@ -692,7 +813,7 @@ def render_trajectory(symbol):
     def cell(col, label, key, fmt):
         with col:
             st.markdown(f"**{label}**")
-            fig = _trend_chart(years, m.get(key), fmt)
+            fig = _trend_bar(years, m.get(key), fmt)
             if fig is None:
                 st.caption("Unavailable from current data source.")
             else:
@@ -717,6 +838,52 @@ def render_trajectory(symbol):
     cell(c2, "Total Debt", "debt", "money")
 
     st.caption(_trajectory_summary(years, m))
+
+
+def _cash_summary(data):
+    m, latest, years = data["metrics"], data["latest"], data["years"]
+    fdir = _direction(m.get("fcf"))
+    if not fdir and latest.get("fcf_growth") is None:
+        return "Not enough history to summarize cash generation."
+    span = f"FY{years[0][2:]}–FY{years[-1][2:]}" if years and len(years[0]) == 4 else "the period"
+    words = {"up": "rising", "down": "declining", "flat": "roughly flat"}
+    bits = []
+    if fdir:
+        bits.append(f"free cash flow {words[fdir]}")
+    g = latest.get("fcf_growth")
+    if g is not None:
+        bits.append(f"latest-year FCF {'up' if g >= 0 else 'down'} {abs(g):,.0f}%")
+    return (f"**Cash generation** over {span} — {', '.join(bits)}. "
+            "Describes the numbers only — it isn't a recommendation.")
+
+
+def render_cash_generation(symbol):
+    data = get_cash_annual(symbol)
+    years, m = data["years"], data["metrics"]
+    if not years:
+        st.caption("Unavailable from current data source.")
+        return
+
+    def cell(col, label, key, fmt):
+        with col:
+            st.markdown(f"**{label}**")
+            fig = _trend_bar(years, m.get(key), fmt)
+            if fig is None:
+                st.caption("Unavailable from current data source.")
+            else:
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    c1, c2 = st.columns(2)
+    cell(c1, "Free Cash Flow", "fcf", "money")
+    cell(c2, "FCF Margin", "fcf_margin", "pct")
+    c1, c2 = st.columns(2)
+    cell(c1, "FCF per Share", "fcf_ps", "pershare")
+    cell(c2, "FCF Yield", "fcf_yield", "pct")
+
+    st.caption(_cash_summary(data))
+    st.caption("Free cash flow is the cash a business generates after reinvesting to keep "
+               "running and growing. For long-term investors, strong and growing free cash flow "
+               "is often more durable than accounting earnings alone.")
 
 
 # ===========================================================================
@@ -808,6 +975,10 @@ def show_ticker(symbol):
     st.caption("How the fundamentals have moved over recent fiscal years (annual). "
                "A quarterly view is planned.")
     render_trajectory(symbol)
+
+    # ---- Cash Generation ----
+    section("Cash Generation", "does it make real money?")
+    render_cash_generation(symbol)
 
     # ---- Valuation ----
     section("Valuation", "what it costs")
