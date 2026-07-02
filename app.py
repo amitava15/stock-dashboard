@@ -942,58 +942,12 @@ def _money_scale(vals):
 
 
 def _trend_chart(years, values, fmt):
-    """A small, quiet trend line for one metric. None if <2 real points."""
+    """A small line-with-points trend for one metric (the value is labeled at
+    each point). A dark baseline marks zero *only when values actually go
+    negative*, so a negative year reads differently from a mere dip.
+    None if fewer than 2 real points."""
     pts = [(y, v) for y, v in zip(years, values) if v is not None]
     if len(pts) < 2:
-        return None
-    xs = [f"FY{y[2:]}" if len(y) == 4 else y for y, _ in pts]
-    ys = [v for _, v in pts]
-
-    tickprefix, ticksuffix, tickformat = "", "", ",.2f"
-    if fmt == "money":
-        scale, unit = _money_scale(ys)
-        ys = [v / scale for v in ys]
-        tickprefix, ticksuffix, tickformat = "$", unit, ",.1f"
-        hov = f"%{{x}}   $%{{y:,.1f}}{unit}<extra></extra>"
-    elif fmt == "pct":
-        ticksuffix, tickformat = "%", ",.0f"
-        hov = "%{x}   %{y:,.1f}%<extra></extra>"
-    elif fmt == "eps":
-        tickprefix, tickformat = "$", ",.2f"
-        hov = "%{x}   $%{y:,.2f}<extra></extra>"
-    else:
-        hov = "%{x}   %{y:,.2f}<extra></extra>"
-
-    fig = go.Figure(go.Scatter(
-        x=xs, y=ys, mode="lines+markers",
-        line=dict(color=INK, width=2),
-        marker=dict(color=INK, size=6),
-        hovertemplate=hov,
-    ))
-    fig.update_layout(
-        height=200, margin=dict(l=6, r=6, t=6, b=6),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=11),
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor=PAPER, bordercolor=LINE,
-                        font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12)),
-        showlegend=False,
-        xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
-                   tickfont=dict(color=MUTED, size=10), fixedrange=True, type="category"),
-        yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot", showline=False,
-                   zeroline=False, ticks="", tickprefix=tickprefix, ticksuffix=ticksuffix,
-                   tickformat=tickformat, tickfont=dict(color=MUTED, size=10), fixedrange=True),
-    )
-    if min(ys) < 0:
-        fig.add_hline(y=0, line=dict(color=LINE, width=1))
-    return fig
-
-
-def _trend_bar(years, values, fmt):
-    """A small bar chart with the actual value labeled on each bar.
-    None if there are no real points. Same formats as _trend_chart."""
-    pts = [(y, v) for y, v in zip(years, values) if v is not None]
-    if len(pts) < 1:
         return None
     xs = [f"FY{y[2:]}" if len(y) == 4 else y for y, _ in pts]
     ys = [v for _, v in pts]
@@ -1013,22 +967,32 @@ def _trend_bar(years, values, fmt):
         labels = [f"{v:,.2f}" for v in ys]
         tickprefix, ticksuffix, tickformat = "", "", ",.2f"
 
-    fig = go.Figure(go.Bar(
-        x=xs, y=ys, text=labels, textposition="outside", cliponaxis=False,
+    # value labels sit above positive points and below negative ones
+    positions = ["top center" if v >= 0 else "bottom center" for v in ys]
+
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="lines+markers+text",
+        line=dict(color=INK, width=2),
+        marker=dict(color=PAPER, size=7, line=dict(color=INK, width=2)),  # hollow points
+        text=labels, textposition=positions, cliponaxis=False,
         textfont=dict(family="IBM Plex Sans, sans-serif", color=INK, size=11),
-        marker=dict(color=INK),
         hovertemplate="%{x}   %{text}<extra></extra>",
     ))
+
     lo, hi = min(ys), max(ys)
     span = (hi - lo) or abs(hi) or 1
     pad = span * 0.22
-    ymin = (lo - pad) if lo < 0 else 0
-    ymax = (hi + pad) if hi > 0 else pad
+    ymin, ymax = lo - pad, hi + pad
+    if lo < 0:
+        ymax = max(ymax, span * 0.06)   # keep the zero baseline on-chart
+
     fig.update_layout(
-        height=210, margin=dict(l=6, r=6, t=14, b=6),
+        height=210, margin=dict(l=10, r=10, t=16, b=6),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=11),
-        showlegend=False, bargap=0.35,
+        hoverlabel=dict(bgcolor=PAPER, bordercolor=LINE,
+                        font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12)),
+        showlegend=False,
         xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
                    tickfont=dict(color=MUTED, size=10), fixedrange=True, type="category"),
         yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot", showline=False,
@@ -1036,8 +1000,11 @@ def _trend_bar(years, values, fmt):
                    tickformat=tickformat, tickfont=dict(color=MUTED, size=10),
                    range=[ymin, ymax], fixedrange=True),
     )
+    # dark zero baseline — the cue that distinguishes a negative from a dip.
+    # Solid near-black against the dotted light gridlines; only drawn when a
+    # value actually crosses zero, so its mere presence signals "went negative".
     if lo < 0:
-        fig.add_hline(y=0, line=dict(color=LINE, width=1))
+        fig.add_hline(y=0, line=dict(color=INK, width=2))
     return fig
 
 
@@ -1088,7 +1055,7 @@ def render_trajectory(symbol):
     def cell(col, label, key, fmt):
         with col:
             st.markdown(f"**{label}**")
-            fig = _trend_bar(years, m.get(key), fmt)
+            fig = _trend_chart(years, m.get(key), fmt)
             if fig is None:
                 st.caption("Unavailable from current data source.")
             else:
@@ -1143,7 +1110,7 @@ def render_cash_generation(symbol):
     def cell(col, label, key, fmt):
         with col:
             st.markdown(f"**{label}**")
-            fig = _trend_bar(years, m.get(key), fmt)
+            fig = _trend_chart(years, m.get(key), fmt)
             if fig is None:
                 st.caption("Unavailable from current data source.")
             else:
@@ -1701,9 +1668,56 @@ def show_movers(kind):
     })
 
 
+# --- sticky compact header + editorial tab styling for the stock page ---
+_STOCK_PAGE_CSS = """
+<style>
+.stock-hdr{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;
+  padding:2px 0 10px;border-bottom:1px solid var(--line,#E8E6DE);margin:0 0 2px}
+.stock-hdr .sh-tkr{font-family:'Fraunces',Georgia,serif;font-weight:700;font-size:1.85rem;
+  line-height:1;letter-spacing:-.01em;color:var(--ink,#23231E)}
+.stock-hdr .sh-co{font-size:.72rem;color:var(--muted,#7A7970);margin-top:5px;letter-spacing:.01em}
+.stock-hdr .sh-px{font-family:'IBM Plex Sans',sans-serif;font-weight:600;font-size:1.45rem;
+  line-height:1;color:var(--ink,#23231E);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.stock-hdr .sh-chg{font-size:.8rem;font-weight:500;margin-top:5px;text-align:right;
+  font-variant-numeric:tabular-nums}
+.stock-hdr .sh-chg.up{color:var(--pos,#2F6B4F)} .stock-hdr .sh-chg.dn{color:var(--neg,#A24A38)}
+
+/* tabs: editorial look, and sticky so navigation stays reachable while scrolling */
+div[data-testid="stTabs"] div[data-baseweb="tab-list"]{
+  position:sticky;top:0;z-index:50;background:var(--paper,#FCFBF8);
+  border-bottom:1px solid var(--line,#E8E6DE);gap:.4rem;padding-top:.35rem;margin-bottom:.5rem}
+div[data-testid="stTabs"] button[data-baseweb="tab"]{
+  background:transparent;padding:.55rem .1rem;font-family:'IBM Plex Sans',sans-serif;
+  font-size:.72rem;font-weight:600;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--muted,#7A7970)}
+div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]{color:var(--ink,#23231E)}
+div[data-testid="stTabs"] div[data-baseweb="tab-highlight"]{background-color:var(--ink,#23231E)}
+div[data-testid="stTabs"] div[data-baseweb="tab-border"]{background-color:transparent}
+</style>
+"""
+
+
+def _render_stock_header(symbol, name, industry, exchange, quote):
+    sub = "  ·  ".join(x for x in (industry, exchange) if x)
+    chg = to_float(quote.get("change_pct"))
+    if chg is None:
+        chg_html = ""
+    else:
+        cls = "up" if chg >= 0 else "dn"
+        arrow = "▲" if chg >= 0 else "▼"
+        chg_html = f'<div class="sh-chg {cls}">{arrow} {abs(chg):.2f}%</div>'
+    st.markdown(
+        '<div class="stock-hdr">'
+        f'<div><div class="sh-tkr">{symbol}</div>'
+        f'<div class="sh-co">{name}{("  ·  " + sub) if sub else ""}</div></div>'
+        f'<div><div class="sh-px">{money(quote.get("price"))}</div>{chg_html}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def show_ticker(symbol):
     symbol = symbol.upper().strip()
-    st.markdown(f'<div class="rt-symbol">{symbol}</div>', unsafe_allow_html=True)
 
     quote = get_quote(symbol)
     if not quote:
@@ -1720,91 +1734,88 @@ def show_ticker(symbol):
     name = profile.get("name") or quote.get("name") or symbol
     industry = profile.get("industry")
     exchange = profile.get("exchange") or quote.get("exchange")
-    header = name + (f"  ·  {industry}" if industry else "")
-    if exchange:
-        header += f"  ·  {exchange}"
-    st.markdown(f'<div class="rt-company">{header}</div>', unsafe_allow_html=True)
 
-    price = quote.get("price")
-    change_pct = quote.get("change_pct")
+    st.markdown(_STOCK_PAGE_CSS, unsafe_allow_html=True)
+    _render_stock_header(symbol, name, industry, exchange, quote)
 
-    # ---- Snapshot ----
-    section("Snapshot", "the essentials")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Price", money(price),
-                  delta=pct(change_pct) if to_float(change_pct) is not None else None)
-    metric_tile(c2, "Market Cap", big_money(profile.get("market_cap") or quote.get("market_cap")), "market_cap")
+    tab_overview, tab_business, tab_valuation, tab_market, tab_notes = st.tabs(
+        ["Overview", "Business", "Valuation", "Market", "Notes"]
+    )
 
-    low, high = quote.get("week_low"), quote.get("week_high")
-    range_val = money_range(low, high)
-    range_note = None
-    p, lo, hi = to_float(price), to_float(low), to_float(high)
-    if None not in (p, lo, hi) and hi > lo:
-        pos = (p - lo) / (hi - lo) * 100
-        range_note = f"Price sits about {pos:.0f}% of the way up its 52-week range."
-    metric_tile(c3, "52-Week Range", range_val, "week_range", note=range_note)
+    # ---------------- OVERVIEW: the essentials + price + AI summary ----------------
+    with tab_overview:
+        section("Snapshot", "the essentials")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Price", money(quote.get("price")),
+                      delta=pct(quote.get("change_pct")) if to_float(quote.get("change_pct")) is not None else None)
+        metric_tile(c2, "Market Cap", big_money(profile.get("market_cap") or quote.get("market_cap")), "market_cap")
 
-    metric_tile(c4, "Avg Daily Volume", big_count(metrics.get("avg_volume")), "volume")
+        low, high = quote.get("week_low"), quote.get("week_high")
+        range_note = None
+        p, lo, hi = to_float(quote.get("price")), to_float(low), to_float(high)
+        if None not in (p, lo, hi) and hi > lo:
+            pos = (p - lo) / (hi - lo) * 100
+            range_note = f"Price sits about {pos:.0f}% of the way up its 52-week range."
+        metric_tile(c3, "52-Week Range", money_range(low, high), "week_range", note=range_note)
+        metric_tile(c4, "Avg Daily Volume", big_count(metrics.get("avg_volume")), "volume")
 
-    # ---- Price ----
-    section("Price", "the trend over time")
-    render_price_chart(symbol)
+        section("Price", "the trend over time")
+        render_price_chart(symbol)
 
-    # ---- Business Trajectory ----
-    section("Business Trajectory", "the shape of the business")
-    st.caption("How the fundamentals have moved over recent fiscal years (annual). "
-               "A quarterly view is planned.")
-    render_trajectory(symbol)
+        section("AI Analysis", "the whole picture, in plain English")
+        render_ai_analysis(symbol)
 
-    # ---- Cash Generation ----
-    section("Cash Generation", "does it make real money?")
-    render_cash_generation(symbol)
+    # ---------------- BUSINESS: fundamentals over time ----------------
+    with tab_business:
+        section("Business Trajectory", "the shape of the business")
+        st.caption("How the fundamentals have moved over recent fiscal years (annual). "
+                   "A quarterly view is planned.")
+        render_trajectory(symbol)
 
-    # ---- Valuation vs Growth ----
-    section("Valuation vs Growth", "is it worth the price?")
-    render_valuation_growth(symbol)
+        section("Cash Generation", "does it make real money?")
+        render_cash_generation(symbol)
 
-    # ---- Analyst Expectations ----
-    section("Analyst Expectations", "what the market already expects")
-    render_analyst(symbol)
+        section("Financial Health", "how it's doing")
+        c1, c2, c3, c4 = st.columns(4)
+        metric_tile(c1, "Net Margin", pct(metrics.get("net_margin_pct")), "net_margin")
+        metric_tile(c2, "Gross Margin", pct(metrics.get("gross_margin_pct")), "gross_margin")
+        metric_tile(c3, "Debt / Equity", num(metrics.get("debt_to_equity")), "debt_equity")
+        metric_tile(c4, "Return on Equity", pct(metrics.get("roe_pct")), "roe")
 
-    # ---- Earnings & Filings ----
-    section("Earnings & Filings", "what's coming, what just happened")
-    render_earnings(symbol)
+    # ---------------- VALUATION ----------------
+    with tab_valuation:
+        section("Valuation vs Growth", "is it worth the price?")
+        render_valuation_growth(symbol)
 
-    # ---- Price Context (light technicals) ----
-    section("Price Context", "is the price stretched or reasonable?")
-    render_technicals(symbol)
+    # ---------------- MARKET: expectations, earnings, price setup ----------------
+    with tab_market:
+        section("Analyst Expectations", "what the market already expects")
+        render_analyst(symbol)
 
-    # ---- Financial health ----
-    section("Financial Health", "how it's doing")
-    c1, c2, c3, c4 = st.columns(4)
-    metric_tile(c1, "Net Margin", pct(metrics.get("net_margin_pct")), "net_margin")
-    metric_tile(c2, "Gross Margin", pct(metrics.get("gross_margin_pct")), "gross_margin")
-    metric_tile(c3, "Debt / Equity", num(metrics.get("debt_to_equity")), "debt_equity")
-    metric_tile(c4, "Return on Equity", pct(metrics.get("roe_pct")), "roe")
+        section("Earnings & Filings", "what's coming, what just happened")
+        render_earnings(symbol)
 
-    # ---- Risk ----
-    section("Risk", "what could move it")
-    c1, c2, c3 = st.columns(3)
-    metric_tile(c1, "Beta", num(metrics.get("beta")), "beta")
-    with c2:
-        st.metric("Day Range", money_range(quote.get("day_low"), quote.get("day_high")))
-    with c3:
-        st.metric("Prev Close", money(quote.get("prev_close")))
+        section("Price Context", "is the price stretched or reasonable?")
+        render_technicals(symbol)
 
-    # ---- AI Analysis ----
-    section("AI Analysis", "the whole picture, in plain English")
-    render_ai_analysis(symbol)
+        section("Risk", "what could move it")
+        c1, c2, c3 = st.columns(3)
+        metric_tile(c1, "Beta", num(metrics.get("beta")), "beta")
+        with c2:
+            st.metric("Day Range", money_range(quote.get("day_low"), quote.get("day_high")))
+        with c3:
+            st.metric("Prev Close", money(quote.get("prev_close")))
 
-    # ---- Your notes ----
-    section("Your Notes", "your call")
-    st.caption("Write your own reasoning. (Session-only for now — permanent saving is a later feature.)")
-    st.text_area("What's your read on this one?", key=f"notes_{symbol}", height=120,
-                 placeholder="e.g. Strong margins but debt looks high for the sector — check latest earnings before deciding.")
-
-    st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics (PEG, EV/EBITDA) may show N/A on the free data tier — the app stays fully usable without them.")
+    # ---------------- NOTES ----------------
+    with tab_notes:
+        section("Your Notes", "your call")
+        st.caption("Write your own reasoning. (Session-only for now — permanent saving is a later feature.)")
+        st.text_area("What's your read on this one?", key=f"notes_{symbol}", height=140,
+                     placeholder="e.g. Business is compounding fast, but it trades above its own 5-yr "
+                                 "multiples — is the growth already priced in? Check next earnings before deciding.")
+        st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics "
+                   "(PEG, EV/EBITDA) may show N/A on the current data tier — the app stays fully usable without them.")
 
 
 # ===========================================================================
