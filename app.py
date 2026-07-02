@@ -91,6 +91,10 @@ hr{ border-color:var(--line); }
 FMP_BASE = "https://financialmodelingprep.com/stable"
 FMP_KEY = st.secrets.get("FMP_API_KEY", "")
 
+# For the optional AI-analysis feature. Model is overridable via secrets so a
+# name change doesn't require a code edit.
+ANTHROPIC_MODEL = st.secrets.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+
 
 # ===========================================================================
 # PLAIN-ENGLISH EXPLAINERS  (shown as a small "?" tooltip on each metric)
@@ -209,6 +213,36 @@ EXPLAINERS = {
         "How far the average analyst price target sits above (or below) today's price.\n\n"
         "**For context:** targets are estimates and get revised often. A large implied upside can "
         "mean a bargain — or that analysts are too optimistic."
+    ),
+    "ma_50": (
+        "The average closing price over the last 50 trading days (about 2½ months).\n\n"
+        "**For context:** price above the 50-day line generally signals near-term strength; below it, "
+        "near-term weakness. It's a trend gauge, not a value gauge."
+    ),
+    "ma_200": (
+        "The average closing price over the last 200 trading days (about 10 months).\n\n"
+        "**For context:** the classic long-term trend line. Above it is often read as a healthy "
+        "up-trend; below it as a longer-term down-trend."
+    ),
+    "rsi": (
+        "A 0–100 momentum gauge of how fast the price has risen or fallen lately (14-day).\n\n"
+        "**For context:** above ~70 is often called 'overbought' (may be stretched), below ~30 "
+        "'oversold' (may be beaten down). It's a short-term signal, not a verdict."
+    ),
+    "dist_high": (
+        "How far today's price sits below its highest point of the past year.\n\n"
+        "**For context:** near 0% means it's close to a 52-week high (momentum, or run up a lot); a "
+        "big negative number means it's well off its highs."
+    ),
+    "dist_low": (
+        "How far today's price sits above its lowest point of the past year.\n\n"
+        "**For context:** a large positive number means it has recovered well from its 52-week low; "
+        "near 0% means it's close to its lows."
+    ),
+    "vol_ratio": (
+        "Today's trading volume compared with its typical daily volume.\n\n"
+        "**For context:** above 1× means unusually heavy trading (news or conviction); below 1× is "
+        "quieter than usual. Big moves on high volume carry more weight."
     ),
 }
 
@@ -1338,6 +1372,301 @@ def render_earnings(symbol):
     st.caption("Earnings press releases and transcripts are planned.")
 
 
+def _rsi(closes, period=14):
+    """14-day Wilder RSI from a list of closing prices (oldest -> newest)."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - 100 / (1 + rs)
+
+
+def get_technicals(symbol):
+    """Light technicals computed locally: MAs (from quote), RSI (from history),
+    distance from 52-week high/low, and volume vs average."""
+    q = get_quote(symbol)
+    raw = _fmp_quote(symbol)
+    price = to_float(q.get("price"))
+    ma50, ma200 = to_float(q.get("ma_50")), to_float(q.get("ma_200"))
+    hi, lo = to_float(q.get("week_high")), to_float(q.get("week_low"))
+    cur_vol = to_float(pick(raw, "volume"))
+    avg_vol = to_float(get_key_metrics(symbol).get("avg_volume"))
+
+    rsi = None
+    df = get_price_history(symbol)
+    if not df.empty:
+        closes = pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
+        if len(closes) > 15:
+            rsi = _rsi(closes[-260:], 14)
+
+    return {
+        "price": price, "ma50": ma50, "ma200": ma200,
+        "above_50": (price > ma50) if (price and ma50) else None,
+        "above_200": (price > ma200) if (price and ma200) else None,
+        "rsi": rsi,
+        "dist_high": ((price / hi - 1) * 100) if (price and hi) else None,
+        "dist_low": ((price / lo - 1) * 100) if (price and lo) else None,
+        "vol_ratio": (cur_vol / avg_vol) if (cur_vol and avg_vol) else None,
+    }
+
+
+def _technicals_read(t):
+    bits = []
+    a50, a200 = t.get("above_50"), t.get("above_200")
+    if a50 is not None and a200 is not None:
+        if a50 and a200:
+            bits.append("trading above both major moving averages (price strength)")
+        elif not a50 and not a200:
+            bits.append("below both major moving averages (price weakness)")
+        else:
+            bits.append("between its 50- and 200-day averages (mixed trend)")
+    rsi = t.get("rsi")
+    if rsi is not None:
+        if rsi >= 70:
+            bits.append(f"RSI {rsi:.0f} is elevated (possibly stretched near-term)")
+        elif rsi <= 30:
+            bits.append(f"RSI {rsi:.0f} is low (possibly oversold)")
+        else:
+            bits.append(f"RSI {rsi:.0f} is neutral")
+    if not bits:
+        return "Price-context data is limited on the current plan."
+    return ("**Price context:** " + ", and ".join(bits) +
+            ". Technicals describe price behavior, not business quality — not a recommendation.")
+
+
+def render_technicals(symbol):
+    t = get_technicals(symbol)
+    if t.get("price") is None:
+        st.caption("Unavailable from current data source.")
+        return
+
+    c = st.columns(3)
+    with c[0]:
+        a = t.get("above_50")
+        st.metric("vs 50-day MA", ("Above" if a else "Below") if a is not None else "N/A",
+                  help=EXPLAINERS.get("ma_50"))
+        if t.get("ma50") is not None:
+            st.caption(f"50-day avg {money(t['ma50'])}")
+    with c[1]:
+        a = t.get("above_200")
+        st.metric("vs 200-day MA", ("Above" if a else "Below") if a is not None else "N/A",
+                  help=EXPLAINERS.get("ma_200"))
+        if t.get("ma200") is not None:
+            st.caption(f"200-day avg {money(t['ma200'])}")
+    with c[2]:
+        rsi = t.get("rsi")
+        st.metric("RSI (14-day)", num(rsi, 0) if rsi is not None else "N/A",
+                  help=EXPLAINERS.get("rsi"))
+        if rsi is not None:
+            st.caption("overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral")
+
+    c = st.columns(3)
+    metric_tile(c[0], "From 52-wk High", pct(t.get("dist_high")), "dist_high")
+    metric_tile(c[1], "From 52-wk Low", pct(t.get("dist_low")), "dist_low")
+    with c[2]:
+        vr = t.get("vol_ratio")
+        st.metric("Volume vs Avg", f"{vr:,.2f}×" if vr is not None else "N/A",
+                  help=EXPLAINERS.get("vol_ratio"))
+
+    st.caption(_technicals_read(t))
+
+
+# ===========================================================================
+# AI ANALYSIS  (optional — calls Claude to explain the whole page in plain English)
+# ===========================================================================
+ANALYSIS_SYSTEM = (
+    "You are a patient financial educator helping someone understand a stock research dashboard. "
+    "You will receive structured data about ONE company: fundamentals and their multi-year "
+    "trajectory, cash generation, valuation versus its own history and growth, analyst "
+    "expectations, upcoming/last earnings, and light technicals.\n\n"
+    "Write a clear, plain-English analysis that:\n"
+    "1. Explains in simple terms what each group of numbers represents (assume the reader is smart "
+    "but NOT a finance expert — define jargon the first time you use it).\n"
+    "2. Ties it into one coherent picture: is the business improving, is it generating real cash, "
+    "does the valuation look demanding or reasonable versus its own history and growth, what do "
+    "analysts expect, and where does the price sit technically.\n"
+    "3. Surfaces tensions and things to watch (e.g. strong growth but a rich valuation, or a big "
+    "gap between accounting profit and cash flow), framed as questions the reader should consider.\n\n"
+    "STRICT RULES:\n"
+    "- Do NOT tell the reader to buy, sell, or hold, and do NOT predict prices or set targets.\n"
+    "- Do NOT invent numbers that aren't in the data. If something is marked unavailable, say so.\n"
+    "- Use short sections with plain headers and short paragraphs.\n"
+    "- End with one line noting this is educational, not financial advice, and that AI can make "
+    "mistakes, so numbers should be verified against primary sources."
+)
+
+
+def _fmt_series(years, vals, fmt):
+    out = []
+    for y, v in zip(years or [], vals or []):
+        if v is None:
+            continue
+        tag = f"FY{y[2:]}" if len(y) == 4 else y
+        if fmt == "money":
+            out.append(f"{tag} {big_money(v)}")
+        elif fmt == "pct":
+            out.append(f"{tag} {v:,.1f}%")
+        elif fmt == "eps":
+            out.append(f"{tag} ${v:,.2f}")
+        else:
+            out.append(f"{tag} {v:,.2f}")
+    return ", ".join(out) if out else "unavailable"
+
+
+def _analysis_payload(symbol):
+    """Assemble everything the dashboard knows into a compact text brief for Claude."""
+    q, prof, m = get_quote(symbol), get_company_profile(symbol), get_key_metrics(symbol)
+    tr, cash = get_trajectory_annual(symbol), get_cash_annual(symbol)
+    val, an, ea, tech = (get_valuation_growth(symbol), get_analyst(symbol),
+                         get_earnings_context(symbol), get_technicals(symbol))
+    ty, tm = tr["years"], tr["metrics"]
+    cy, cm = cash["years"], cash["metrics"]
+    cur, gro, hist = val["current"], val["growth"], val["history"]
+    L = []
+    L.append(f"COMPANY: {prof.get('name') or q.get('name') or symbol} ({symbol})")
+    L.append(f"Industry: {prof.get('industry') or '?'} | Sector: {prof.get('sector') or '?'} "
+             f"| Exchange: {q.get('exchange') or '?'}")
+    L.append(f"Price {money(q.get('price'))} | Market cap {big_money(q.get('market_cap'))} "
+             f"| 52-wk {money(q.get('week_low'))}–{money(q.get('week_high'))}")
+
+    L.append("\n[BUSINESS TRAJECTORY, annual]")
+    L.append(f"Revenue: {_fmt_series(ty, tm.get('revenue'), 'money')}")
+    L.append(f"EPS diluted: {_fmt_series(ty, tm.get('eps'), 'eps')}")
+    L.append(f"Gross margin: {_fmt_series(ty, tm.get('gross_margin'), 'pct')}")
+    L.append(f"Operating margin: {_fmt_series(ty, tm.get('op_margin'), 'pct')}")
+    L.append(f"Net margin: {_fmt_series(ty, tm.get('net_margin'), 'pct')}")
+    L.append(f"ROE: {_fmt_series(ty, tm.get('roe'), 'pct')}")
+    L.append(f"Free cash flow: {_fmt_series(ty, tm.get('fcf'), 'money')}")
+    L.append(f"Total debt: {_fmt_series(ty, tm.get('debt'), 'money')}")
+
+    L.append("\n[CASH GENERATION, annual]")
+    L.append(f"FCF: {_fmt_series(cy, cm.get('fcf'), 'money')}")
+    L.append(f"FCF margin: {_fmt_series(cy, cm.get('fcf_margin'), 'pct')}")
+    L.append(f"FCF per share: {_fmt_series(cy, cm.get('fcf_ps'), 'eps')}")
+    L.append(f"FCF yield: {_fmt_series(cy, cm.get('fcf_yield'), 'pct')}")
+
+    L.append("\n[VALUATION vs GROWTH — current TTM]")
+    L.append(f"P/E {num(cur.get('pe'))} | Forward P/E {num(cur.get('forward_pe'))} "
+             f"| PEG {num(cur.get('peg'))} | EV/EBITDA {num(cur.get('ev_ebitda'))} "
+             f"| P/S {num(cur.get('ps'))} | FCF yield {pct(cur.get('fcf_yield'))}")
+    L.append(f"Growth YoY — revenue {pct(gro.get('revenue'))}, EPS {pct(gro.get('eps'))}, "
+             f"FCF {pct(gro.get('fcf'))}")
+    L.append(f"Vs 5-yr median — P/E now {num(hist['pe']['now'])} vs {num(hist['pe']['median'])}; "
+             f"EV/EBITDA {num(hist['ev']['now'])} vs {num(hist['ev']['median'])}; "
+             f"P/S {num(hist['ps']['now'])} vs {num(hist['ps']['median'])}")
+
+    L.append("\n[ANALYST EXPECTATIONS]")
+    g = an["grades"]
+    L.append(f"Consensus {an.get('consensus') or '?'} "
+             f"(strongBuy {int(g.get('strongBuy') or 0)}, buy {int(g.get('buy') or 0)}, "
+             f"hold {int(g.get('hold') or 0)}, sell {int(g.get('sell') or 0)}, "
+             f"strongSell {int(g.get('strongSell') or 0)})")
+    tg = an["target"]
+    L.append(f"Price target low {money(tg.get('low'))} / avg {money(tg.get('avg'))} / "
+             f"high {money(tg.get('high'))} | implied {pct(tg.get('upside'))} vs price")
+    fw = an["forward"]
+    L.append(f"Forward est ({fw.get('year') or '?'}): revenue {big_money(fw.get('revenue'))}, "
+             f"EPS {money(fw.get('eps'))}")
+
+    L.append("\n[EARNINGS]")
+    nxt, last = ea.get("next"), ea.get("last")
+    if nxt:
+        L.append(f"Next earnings {nxt.get('date')} ({nxt.get('days')} days away), "
+                 f"EPS est {money(nxt.get('eps_est'))}")
+    if last:
+        L.append(f"Last earnings {last.get('date')}: EPS {money(last.get('eps_actual'))} vs est "
+                 f"{money(last.get('eps_est'))} ({_beat_str(last.get('eps_surprise')) or 'n/a'}); "
+                 f"revenue {big_money(last.get('rev_actual'))} vs est {big_money(last.get('rev_est'))} "
+                 f"({_beat_str(last.get('rev_surprise')) or 'n/a'})")
+
+    L.append("\n[PRICE CONTEXT / TECHNICALS]")
+    L.append(f"50-day MA {money(tech.get('ma50'))} (price is "
+             f"{'above' if tech.get('above_50') else 'below' if tech.get('above_50') is not None else '?'}); "
+             f"200-day MA {money(tech.get('ma200'))} (price is "
+             f"{'above' if tech.get('above_200') else 'below' if tech.get('above_200') is not None else '?'})")
+    L.append(f"RSI(14) {num(tech.get('rsi'), 0)} | from 52-wk high {pct(tech.get('dist_high'))} | "
+             f"from 52-wk low {pct(tech.get('dist_low'))} | volume vs avg "
+             f"{num(tech.get('vol_ratio'))}x")
+
+    L.append("\n[FILINGS] Full SEC filings (10-K/10-Q/8-K) are available on EDGAR; not included as "
+             "raw text here. The figures above are derived from those filings.")
+    return "\n".join(L)
+
+
+def generate_ai_analysis(payload_text):
+    """Call Claude's Messages API. Returns (text, error). Uses raw HTTP so no extra
+    dependency is needed. Reads the key from Streamlit secrets."""
+    key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return None, "no_key"
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": ANTHROPIC_MODEL, "max_tokens": 2500,
+                  "system": ANALYSIS_SYSTEM,
+                  "messages": [{"role": "user", "content":
+                                "Here is the dashboard data. Please write the plain-English "
+                                "analysis.\n\n" + payload_text}]},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        text = "\n".join(p for p in parts if p).strip()
+        return (text or None), (None if text else "empty response")
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "?")
+        detail = ""
+        try:
+            detail = e.response.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        return None, f"HTTP {code} {detail}".strip()
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+def render_ai_analysis(symbol):
+    if not st.secrets.get("ANTHROPIC_API_KEY", ""):
+        st.info(
+            "**AI analysis needs an Anthropic API key** — this is separate from your Claude.ai "
+            "subscription and is billed per use (a few cents per analysis).\n\n"
+            "1. Get a key at https://console.anthropic.com\n"
+            "2. Add it to your Streamlit app's secrets as `ANTHROPIC_API_KEY = \"sk-ant-...\"`\n"
+            "3. Reload. Then a **Generate AI analysis** button appears here."
+        )
+        return
+
+    st.caption("Claude reads everything above and explains — in plain English — what each metric "
+               "means and how it ties together. Educational only, not financial advice. "
+               "Each run costs a few cents of API usage.")
+    cache = st.session_state.setdefault("ai_analysis", {})
+    if st.button("✨ Generate AI analysis", key=f"ai_btn_{symbol}"):
+        with st.spinner("Claude is reading the data…"):
+            text, err = generate_ai_analysis(_analysis_payload(symbol))
+        if err:
+            st.error(f"Analysis failed ({err}). Check the API key, and if it mentions the model, "
+                     "set `ANTHROPIC_MODEL` in your secrets to a current model name.")
+        else:
+            cache[symbol] = text
+
+    if cache.get(symbol):
+        st.markdown(cache[symbol])
+        st.caption("⚠️ AI-generated — it explains the data shown and may contain errors. It does not "
+                   "predict prices or recommend buying or selling. Verify against primary sources.")
+
+
 # ===========================================================================
 # Views
 # ===========================================================================
@@ -1444,6 +1773,10 @@ def show_ticker(symbol):
     section("Earnings & Filings", "what's coming, what just happened")
     render_earnings(symbol)
 
+    # ---- Price Context (light technicals) ----
+    section("Price Context", "is the price stretched or reasonable?")
+    render_technicals(symbol)
+
     # ---- Financial health ----
     section("Financial Health", "how it's doing")
     c1, c2, c3, c4 = st.columns(4)
@@ -1460,6 +1793,10 @@ def show_ticker(symbol):
         st.metric("Day Range", money_range(quote.get("day_low"), quote.get("day_high")))
     with c3:
         st.metric("Prev Close", money(quote.get("prev_close")))
+
+    # ---- AI Analysis ----
+    section("AI Analysis", "the whole picture, in plain English")
+    render_ai_analysis(symbol)
 
     # ---- Your notes ----
     section("Your Notes", "your call")
