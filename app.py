@@ -155,6 +155,51 @@ EXPLAINERS = {
         "**For tradability:** high volume means the stock is easy to buy and sell, and big price "
         "moves on high volume carry more conviction than moves on light trading."
     ),
+    "forward_pe": (
+        "Like P/E, but using analysts' estimate of next year's profit instead of last year's.\n\n"
+        "**For the business:** if forward P/E is lower than trailing P/E, the market expects profits "
+        "to grow. Relies on analyst estimates, which can be wrong."
+    ),
+    "price_sales": (
+        "How many dollars you pay for each $1 of the company's yearly sales.\n\n"
+        "**For the business:** useful when profits are thin or negative. High P/S means a lot of "
+        "growth is priced in; compare within the same industry."
+    ),
+    "fcf_yield": (
+        "The free cash flow the company throws off, as a percentage of its market value.\n\n"
+        "**For the business:** think of it like an interest rate on the stock — higher means more "
+        "cash generated for the price. Low FCF yield means you're paying up for future growth."
+    ),
+    "revenue_growth": (
+        "How fast yearly sales grew versus the year before.\n\n"
+        "**For the business:** the top-line engine. Steady growth is the clearest sign demand is "
+        "expanding; a single year can be lumpy, so read it alongside the multi-year trend above."
+    ),
+    "eps_growth": (
+        "How fast earnings per share grew versus the year before.\n\n"
+        "**For the business:** growth in per-share profit is what compounds shareholder value. Watch "
+        "for growth coming from real profit, not just fewer shares. Very small bases make % look wild."
+    ),
+    "fcf_growth": (
+        "How fast free cash flow grew versus the year before.\n\n"
+        "**For the business:** growing cash generation is hard to fake and tends to be durable. Note "
+        "that when the prior year was near zero, the percentage can look extreme."
+    ),
+    "pe_vs_median": (
+        "Today's P/E next to the middle of its own last-5-years range.\n\n"
+        "**For the business:** answers 'is the stock expensive versus its own history?' Above its "
+        "median means pricier than usual — justified only if growth or quality has improved."
+    ),
+    "ev_vs_median": (
+        "Today's EV/EBITDA next to the middle of its own last-5-years range.\n\n"
+        "**For the business:** a debt-aware version of the same 'expensive vs its own history?' "
+        "check. Well above the median means the market is paying a premium to the past."
+    ),
+    "ps_vs_median": (
+        "Today's Price/Sales next to the middle of its own last-5-years range.\n\n"
+        "**For the business:** shows whether the market is paying more per dollar of sales than it "
+        "usually has. A big jump often signals rich expectations."
+    ),
 }
 
 
@@ -507,6 +552,105 @@ def get_cash_annual(symbol, years=6):
         "fcf_growth": growth,
     }
     return {"years": order, "metrics": metrics, "latest": latest}
+
+
+def _median(vals, positive_only=False):
+    xs = [v for v in vals if v is not None]
+    if positive_only:
+        xs = [v for v in xs if v > 0]
+    if not xs:
+        return None
+    xs.sort()
+    n, mid = len(xs), len(xs) // 2
+    return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def _yoy(series):
+    pts = [v for v in series if v is not None]
+    if len(pts) < 2 or pts[-2] == 0:
+        return None
+    return (pts[-1] - pts[-2]) / abs(pts[-2]) * 100
+
+
+def get_valuation_growth(symbol, years=6):
+    """Current valuation (TTM), growth context (YoY), and each multiple vs its
+    own 5-year median. Forward P/E needs analyst estimates and degrades to None
+    if that endpoint isn't on the current plan."""
+    sym = symbol.upper()
+    rt = _fmp_ratios_ttm(sym)
+    kt = _fmp_keymetrics_ttm(sym)
+    q = _fmp_quote(sym)
+    inc = _fmp_statement(f"income-statement?symbol={sym}&period=annual&limit={years}")
+    cf = _fmp_statement(f"cash-flow-statement?symbol={sym}&period=annual&limit={years}")
+    km = _fmp_statement(f"key-metrics?symbol={sym}&period=annual&limit={years}")
+    ra = _fmp_statement(f"ratios?symbol={sym}&period=annual&limit={years}")
+
+    def by_year(rows):
+        out = {}
+        for r in rows or []:
+            y = str(r.get("fiscalYear") or r.get("calendarYear") or "")
+            if not y and r.get("date"):
+                y = str(r["date"])[:4]
+            if y:
+                out.setdefault(y, r)
+        return out
+
+    inc_y, cf_y, km_y, ra_y = by_year(inc), by_year(cf), by_year(km), by_year(ra)
+    order = sorted(inc_y.keys())[-years:]
+
+    revenue = [to_float(inc_y.get(y, {}).get("revenue")) for y in order]
+    eps = [to_float(pick(inc_y.get(y, {}), "epsDiluted", "eps")) for y in order]
+
+    def fcf_of(y):
+        row = cf_y.get(y, {})
+        v = to_float(pick(row, "freeCashFlow"))
+        if v is not None:
+            return v
+        o = to_float(pick(row, "operatingCashFlow", "netCashProvidedByOperatingActivities"))
+        c = to_float(pick(row, "capitalExpenditure"))
+        return None if (o is None or c is None) else o - abs(c)
+
+    fcf = [fcf_of(y) for y in order]
+    pe_hist = [to_float(pick(ra_y.get(y, {}), "priceToEarningsRatio")) for y in order]
+    ev_hist = [to_float(pick(km_y.get(y, {}), "evToEBITDA")) for y in order]
+    ps_hist = [to_float(pick(ra_y.get(y, {}), "priceToSalesRatio")) for y in order]
+
+    pe = to_float(pick(rt, "priceToEarningsRatioTTM"))
+    peg = to_float(pick(rt, "priceToEarningsGrowthRatioTTM"))
+    ev = (to_float(pick(kt, "evToEBITDATTM", "enterpriseValueMultipleTTM"))
+          or to_float(pick(rt, "enterpriseValueMultipleTTM")))
+    ps = to_float(pick(rt, "priceToSalesRatioTTM"))
+    fy = to_float(pick(kt, "freeCashFlowYieldTTM"))
+    fcf_yield = fy * 100 if fy is not None else None
+
+    # Forward P/E from analyst estimates (may be gated -> stays None).
+    fwd_pe = None
+    price = to_float(pick(q, "price"))
+    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=5")
+    if est and price is not None:
+        import datetime as _dt
+        this_year = _dt.date.today().year
+        best = None
+        for r in est:
+            yr = str(r.get("date") or r.get("fiscalYear") or "")[:4]
+            eps_est = to_float(pick(r, "epsAvg", "estimatedEpsAvg", "estimatedEps", "epsEstimated"))
+            if eps_est and eps_est > 0 and yr.isdigit() and int(yr) >= this_year:
+                if best is None or int(yr) < best[0]:
+                    best = (int(yr), eps_est)
+        if best:
+            fwd_pe = price / best[1]
+
+    return {
+        "current": {"pe": pe, "forward_pe": fwd_pe, "peg": peg,
+                    "ev_ebitda": ev, "ps": ps, "fcf_yield": fcf_yield},
+        "growth": {"revenue": _yoy(revenue), "eps": _yoy(eps), "fcf": _yoy(fcf)},
+        "history": {
+            "pe": {"now": pe, "median": _median(pe_hist, positive_only=True)},
+            "ev": {"now": ev, "median": _median(ev_hist, positive_only=True)},
+            "ps": {"now": ps, "median": _median(ps_hist, positive_only=True)},
+        },
+        "years": order,
+    }
 
 
 # ===========================================================================
@@ -888,6 +1032,77 @@ def render_cash_generation(symbol):
                "is often more durable than accounting earnings alone.")
 
 
+def _cmp_word(now, med):
+    if now is None or med is None or med == 0:
+        return None
+    r = now / med
+    return "above" if r >= 1.15 else "below" if r <= 0.85 else "near"
+
+
+def _valuation_read(d):
+    hist, gro = d["history"], d["growth"]
+    words = [w for w in (_cmp_word(hist[k]["now"], hist[k]["median"]) for k in ("pe", "ev", "ps")) if w]
+    if words:
+        if words.count("above") >= 2:
+            val = "above"
+        elif words.count("below") >= 2:
+            val = "below"
+        else:
+            val = "near"
+        val_sentence = f"The stock trades **{val}** its own 5-year valuation range"
+    else:
+        val_sentence = "Historical valuation context is limited on the current data"
+    rg = gro.get("revenue")
+    grow = ""
+    if rg is not None:
+        gw = "growing" if rg > 5 else "shrinking" if rg < -5 else "roughly flat"
+        grow = f", and revenue is **{gw}** ({rg:+,.0f}% year over year)"
+    return (f"**Valuation read:** {val_sentence}{grow}. "
+            "This describes the numbers only — it isn't a recommendation.")
+
+
+def render_valuation_growth(symbol):
+    d = get_valuation_growth(symbol)
+    cur, gro, hist = d["current"], d["growth"], d["history"]
+
+    _subgroup("Current Valuation")
+    c = st.columns(3)
+    metric_tile(c[0], "P/E (TTM)", num(cur.get("pe")), "pe")
+    metric_tile(c[1], "Forward P/E", num(cur.get("forward_pe")), "forward_pe")
+    metric_tile(c[2], "PEG", num(cur.get("peg")), "peg")
+    c = st.columns(3)
+    metric_tile(c[0], "EV / EBITDA", num(cur.get("ev_ebitda")), "ev_ebitda")
+    metric_tile(c[1], "Price / Sales", num(cur.get("ps")), "price_sales")
+    metric_tile(c[2], "FCF Yield", pct(cur.get("fcf_yield")), "fcf_yield")
+
+    _subgroup("Growth Context")
+    c = st.columns(3)
+    metric_tile(c[0], "Revenue Growth (YoY)", pct(gro.get("revenue")), "revenue_growth")
+    metric_tile(c[1], "EPS Growth (YoY)", pct(gro.get("eps")), "eps_growth")
+    metric_tile(c[2], "FCF Growth (YoY)", pct(gro.get("fcf")), "fcf_growth")
+
+    _subgroup("Historical Context")
+    c = st.columns(3)
+
+    def hist_tile(col, label, item, help_key):
+        now, med = item.get("now"), item.get("median")
+        word = _cmp_word(now, med)
+        with col:
+            st.metric(label, num(now), help=EXPLAINERS.get(help_key))
+            if med is not None:
+                tail = f" · trading **{word}**" if word else ""
+                st.caption(f"5-yr median **{num(med)}**{tail}")
+            else:
+                st.caption("5-yr median unavailable")
+
+    hist_tile(c[0], "P/E now", hist["pe"], "pe_vs_median")
+    hist_tile(c[1], "EV/EBITDA now", hist["ev"], "ev_vs_median")
+    hist_tile(c[2], "P/S now", hist["ps"], "ps_vs_median")
+
+    st.caption(_valuation_read(d))
+    st.caption("Comparison to a *peer* median is coming with the Peer Context section.")
+
+
 # ===========================================================================
 # Views
 # ===========================================================================
@@ -982,12 +1197,9 @@ def show_ticker(symbol):
     section("Cash Generation", "does it make real money?")
     render_cash_generation(symbol)
 
-    # ---- Valuation ----
-    section("Valuation", "what it costs")
-    c1, c2, c3 = st.columns(3)
-    metric_tile(c1, "P/E (trailing)", num(metrics.get("pe")), "pe")
-    metric_tile(c2, "PEG", num(metrics.get("peg")), "peg")
-    metric_tile(c3, "EV / EBITDA", num(metrics.get("ev_ebitda")), "ev_ebitda")
+    # ---- Valuation vs Growth ----
+    section("Valuation vs Growth", "is it worth the price?")
+    render_valuation_growth(symbol)
 
     # ---- Financial health ----
     section("Financial Health", "how it's doing")
