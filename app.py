@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.10.1"
+APP_VERSION = "0.10.2"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -2870,12 +2870,7 @@ def _run_daily_scan(date_str, universe):
                      "score": _focus_score(m, trend, sym), "m": m})
         _t.sleep(0.03)   # gentle throttle to stay under the 300/min Starter cap
     rows.sort(key=lambda r: r["score"], reverse=True)
-    top = rows[:20]
-    for r in top:      # company names for the top 20 only (cheap)
-        prof = get_company_profile(r["symbol"])
-        r["name"] = prof.get("name") or r["symbol"]
-        r["why"] = _why_explore(r["m"], r["trend"])
-    return top, len(rows)
+    return rows, len(rows)
 
 
 def _delta_html(v, label):
@@ -2897,15 +2892,35 @@ def render_top_stocks():
                "scans ~500 names and takes a minute or two; after that it's cached and instant.")
     today = _dt.date.today()
     with st.spinner("Scanning the S&P 500 for today's trends\u2026  (first load of the day only)"):
-        top, scanned = _run_daily_scan(today.isoformat(), SP500)
+        ranked, scanned = _run_daily_scan(today.isoformat(), SP500)
 
-    if not top:
+    if not ranked:
         st.info("Nothing to show yet. If this is the very first load it may still be warming up, or "
                 "price history is briefly unavailable — try again in a moment.")
         return
 
-    st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 showing the top {len(top)} "
-               "by Focus Priority.")
+    direction = st.radio("Direction", ["Rising", "Falling", "Both"], horizontal=True,
+                         index=0, label_visibility="collapsed", key="top_direction")
+    if direction == "Rising":
+        pool = [r for r in ranked if (r["m"].get("r20") or 0) > 0]
+    elif direction == "Falling":
+        pool = [r for r in ranked if (r["m"].get("r20") or 0) < 0]
+    else:
+        pool = ranked
+    top = pool[:20]
+    for r in top:      # company name + reason only for the 20 actually shown (cheap, cached)
+        if "name" not in r:
+            r["name"] = (get_company_profile(r["symbol"]).get("name") or r["symbol"])
+            r["why"] = _why_explore(r["m"], r["trend"])
+
+    if not top:
+        st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 no "
+                   f"{direction.lower()} names cleared the bar today.")
+        return
+
+    dtxt = {"Rising": "rising", "Falling": "falling", "Both": "moving"}[direction]
+    st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 showing the top "
+               f"{len(top)} {dtxt} by Focus Priority.")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
                 unsafe_allow_html=True)
 
