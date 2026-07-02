@@ -6,11 +6,11 @@ get_key_metrics(), search_companies() — and doesn't care which provider
 answers. Adding a provider later means editing one section, not the whole app.
 
 Providers wired now:
-  • FMP (free)      -> movers lists + company/ticker search  (work for all tickers)
-  • Finnhub (free)  -> quote, profile, fundamentals          (work for all tickers)
+  • FMP Starter     -> movers, search, real-time quote, profile, TTM ratios/metrics,
+                       and historical prices  (all US tickers, one provider)
 Stubs for later:
   • SEC EDGAR       -> filings          (get_filings, placeholder)
-  • Finnhub news    -> news/sentiment   (get_news, placeholder)
+  • News            -> FMP /news/stock  (get_news, placeholder)
 
 This app AGGREGATES and EXPLAINS. It never tells you to buy or sell.
 """
@@ -89,10 +89,7 @@ hr{ border-color:var(--line); }
 """, unsafe_allow_html=True)
 
 FMP_BASE = "https://financialmodelingprep.com/stable"
-FINNHUB_BASE = "https://finnhub.io/api/v1"
-
 FMP_KEY = st.secrets.get("FMP_API_KEY", "")
-FINNHUB_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 
 
 # ===========================================================================
@@ -135,7 +132,7 @@ EXPLAINERS = {
         "How much the company relies on borrowed money versus its owners' money.\n\n"
         "**For the business:** more debt can boost returns but adds risk — if sales dip or interest "
         "rates rise, heavy debt bites. What's 'safe' depends on the industry. "
-        "(Shown as a %: 150 means 1.5× equity.)"
+        "(Shown as a ratio: 0.5 means debt is half of equity; 1.0 means they're equal.)"
     ),
     "roe": (
         "How much profit the company makes from the money shareholders have put in.\n\n"
@@ -244,22 +241,25 @@ def get_price_history(symbol: str):
 
 
 # ===========================================================================
-# PROVIDER: Finnhub  (quote, profile, fundamentals — work for all tickers, free)
+# PROVIDER: FMP detail endpoints  (quote, profile, TTM ratios/metrics — Starter)
+# One provider for everything: real-time quote, company profile, and *trailing-
+# twelve-month* ratios so figures like P/E stay current (not frozen at last FY).
 # ===========================================================================
-@st.cache_data(ttl=900, show_spinner=False)
-def _finnhub_get(path: str):
-    sep = "&" if "?" in path else "?"
-    url = f"{FINNHUB_BASE}/{path}{sep}token={FINNHUB_KEY}"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+def _fmp_first(path: str):
+    """FMP detail endpoints return a one-item list; grab [0] safely ({} on error)."""
+    try:
+        data = _fmp_get(path)
+    except requests.HTTPError:
+        return {}
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return data if isinstance(data, dict) else {}
 
 
-def _fh_quote(symbol):    return _finnhub_get(f"quote?symbol={symbol}")
-def _fh_profile(symbol):  return _finnhub_get(f"stock/profile2?symbol={symbol}")
-def _fh_metric(symbol):
-    data = _finnhub_get(f"stock/metric?symbol={symbol}&metric=all")
-    return data.get("metric", {}) if isinstance(data, dict) else {}
+def _fmp_quote(symbol):          return _fmp_first(f"quote?symbol={symbol}")
+def _fmp_profile(symbol):        return _fmp_first(f"profile?symbol={symbol}")
+def _fmp_ratios_ttm(symbol):     return _fmp_first(f"ratios-ttm?symbol={symbol}")
+def _fmp_keymetrics_ttm(symbol): return _fmp_first(f"key-metrics-ttm?symbol={symbol}")
 
 
 # ===========================================================================
@@ -271,59 +271,81 @@ def get_filings(symbol):
 
 
 def get_news(symbol):
-    """TODO: pull recent news via Finnhub /company-news. Not built yet."""
+    """TODO: pull recent news via FMP /news/stock. Not built yet."""
     return []
 
 
 # ===========================================================================
 # NORMALIZED INTERFACE  (provider-agnostic; units normalized here)
 # ===========================================================================
+def _avg_volume_from_history(symbol):
+    """Fallback average daily volume: mean of the last 30 sessions' volume."""
+    df = get_price_history(symbol)
+    if df.empty or "volume" not in df.columns:
+        return None
+    tail = pd.to_numeric(df.tail(30)["volume"], errors="coerce").dropna()
+    return float(tail.mean()) if len(tail) else None
+
+
 def get_quote(symbol):
-    q = _fh_quote(symbol)
-    if not isinstance(q, dict) or not q.get("c"):   # c==0 -> unknown symbol
+    q = _fmp_quote(symbol)
+    if not isinstance(q, dict) or q.get("price") is None:   # unknown/uncovered symbol
         return {}
     return {
-        "price": q.get("c"),
-        "change_pct": q.get("dp"),
-        "day_high": q.get("h"),
-        "day_low": q.get("l"),
-        "prev_close": q.get("pc"),
+        "price": q.get("price"),
+        "change_pct": q.get("changePercentage"),   # already a percent (e.g. -10.57)
+        "day_high": q.get("dayHigh"),
+        "day_low": q.get("dayLow"),
+        "prev_close": q.get("previousClose"),
+        "market_cap": q.get("marketCap"),           # absolute dollars (not millions)
+        "week_high": q.get("yearHigh"),             # 52-week range lives on the quote
+        "week_low": q.get("yearLow"),
+        "name": q.get("name"),
+        "exchange": q.get("exchange"),
+        "ma_50": q.get("priceAvg50"),
+        "ma_200": q.get("priceAvg200"),
     }
 
 
 def get_company_profile(symbol):
-    p = _fh_profile(symbol)
+    p = _fmp_profile(symbol)
     if not isinstance(p, dict) or not p:
         return {}
-    mcap = p.get("marketCapitalization")  # Finnhub gives this in millions
     return {
-        "name": p.get("name"),
-        "exchange": p.get("exchange"),
-        "industry": p.get("finnhubIndustry"),
-        "market_cap": mcap * 1e6 if isinstance(mcap, (int, float)) else None,
+        "name": pick(p, "companyName", "name"),
+        "exchange": pick(p, "exchangeShortName", "exchange"),
+        "industry": pick(p, "industry"),
+        "sector": pick(p, "sector"),
+        "market_cap": pick(p, "marketCap", "mktCap"),
+        "beta": pick(p, "beta"),
+        "avg_volume": pick(p, "averageVolume", "avgVolume", "volAvg"),
     }
 
 
 def get_key_metrics(symbol):
-    m = _fh_metric(symbol)
+    r = _fmp_ratios_ttm(symbol)       # margins, P/E, PEG, debt/equity
+    k = _fmp_keymetrics_ttm(symbol)   # EV/EBITDA, ROE
+    p = _fmp_profile(symbol)          # beta, avg volume (cached; shared with profile)
 
-    def g(*keys):
-        return pick(m, *keys)
+    def as_pct(x):                    # FMP gives margins/ROE as fractions (0.55 -> 55%)
+        f = to_float(x)
+        return f * 100 if f is not None else None
 
-    avg_vol_m = g("10DayAverageTradingVolume", "3MonthAverageTradingVolume")  # millions of shares
+    avg_vol = pick(p, "averageVolume", "avgVolume", "volAvg")
+    if avg_vol is None:
+        avg_vol = _avg_volume_from_history(symbol)
+
     return {
-        "pe": g("peTTM", "peBasicExclExtraTTM", "peInclExtraTTM", "peNormalizedAnnual"),
-        "peg": g("pegTTM", "pegRatioTTM"),
-        "ev_ebitda": g("evEbitdaTTM", "currentEv/ebitdaTTM", "enterpriseValueEbitdaTTM"),
-        "net_margin_pct": g("netProfitMarginTTM", "netProfitMarginAnnual"),
-        "gross_margin_pct": g("grossMarginTTM", "grossMarginAnnual"),
-        "debt_to_equity": g("totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual",
-                            "longTermDebt/equityQuarterly", "longTermDebt/equityAnnual"),
-        "roe_pct": g("roeTTM", "roeRfy"),
-        "beta": g("beta"),
-        "week_high": g("52WeekHigh"),
-        "week_low": g("52WeekLow"),
-        "avg_volume": avg_vol_m * 1e6 if isinstance(avg_vol_m, (int, float)) else None,
+        "pe": pick(r, "priceToEarningsRatioTTM"),
+        "peg": pick(r, "priceToEarningsGrowthRatioTTM"),
+        "ev_ebitda": pick(k, "evToEBITDATTM", "enterpriseValueMultipleTTM")
+                     or pick(r, "enterpriseValueMultipleTTM"),
+        "net_margin_pct": as_pct(pick(r, "netProfitMarginTTM", "bottomLineProfitMarginTTM")),
+        "gross_margin_pct": as_pct(pick(r, "grossProfitMarginTTM")),
+        "debt_to_equity": pick(r, "debtToEquityRatioTTM"),
+        "roe_pct": as_pct(pick(k, "returnOnEquityTTM")),
+        "beta": pick(p, "beta"),
+        "avg_volume": avg_vol,
     }
 
 
@@ -503,50 +525,23 @@ def show_ticker(symbol):
     symbol = symbol.upper().strip()
     st.markdown(f'<div class="rt-symbol">{symbol}</div>', unsafe_allow_html=True)
 
-    if not FINNHUB_KEY:
-        st.info(
-            "**One quick setup step to unlock stock details (free):**\n"
-            "1. Get a free key at https://finnhub.io/register\n"
-            "2. Add it to your Streamlit secrets as `FINNHUB_API_KEY = \"your_key\"`\n"
-            "3. Reload. The movers lists already work without it."
+    quote = get_quote(symbol)
+    if not quote:
+        st.warning(
+            f"No data found for **{symbol}** on the current plan. Check the ticker — it may be a "
+            "fund, index, or non-US listing. Try a US-listed stock (e.g. **MU** for Micron)."
         )
         return
 
-    try:
-        quote = get_quote(symbol)
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", None)
-        if status == 401:
-            st.error("Finnhub rejected the API key. Double-check `FINNHUB_API_KEY` in your Streamlit secrets.")
-        elif status == 403:
-            st.warning(
-                f"**{symbol}** isn't covered by the free stock data — it's likely a fund, forex pair, "
-                "index, or non-US listing. Try a common US-listed stock (e.g. **MU** for Micron)."
-            )
-        elif status == 429:
-            st.warning("Hit Finnhub's rate limit (60/min on free). Wait a minute and try again.")
-        else:
-            st.error(f"Couldn't fetch data for {symbol}. ({e})")
-        return
+    profile = get_company_profile(symbol)
+    metrics = get_key_metrics(symbol)
 
-    if not quote:
-        st.warning(f"No data found for '{symbol}'. Double-check the ticker symbol.")
-        return
-
-    try:
-        profile = get_company_profile(symbol)
-    except requests.HTTPError:
-        profile = {}
-    try:
-        metrics = get_key_metrics(symbol)
-    except requests.HTTPError:
-        metrics = {}
-
-    name = profile.get("name") or symbol
+    name = profile.get("name") or quote.get("name") or symbol
     industry = profile.get("industry")
+    exchange = profile.get("exchange") or quote.get("exchange")
     header = name + (f"  ·  {industry}" if industry else "")
-    if profile.get("exchange"):
-        header += f"  ·  {profile['exchange']}"
+    if exchange:
+        header += f"  ·  {exchange}"
     st.markdown(f'<div class="rt-company">{header}</div>', unsafe_allow_html=True)
 
     price = quote.get("price")
@@ -558,9 +553,9 @@ def show_ticker(symbol):
     with c1:
         st.metric("Price", money(price),
                   delta=pct(change_pct) if to_float(change_pct) is not None else None)
-    metric_tile(c2, "Market Cap", big_money(profile.get("market_cap")), "market_cap")
+    metric_tile(c2, "Market Cap", big_money(profile.get("market_cap") or quote.get("market_cap")), "market_cap")
 
-    low, high = metrics.get("week_low"), metrics.get("week_high")
+    low, high = quote.get("week_low"), quote.get("week_high")
     range_val = f"{money(low)} – {money(high)}" if to_float(low) and to_float(high) else "N/A"
     range_note = None
     p, lo, hi = to_float(price), to_float(low), to_float(high)
@@ -673,8 +668,7 @@ if not FMP_KEY:
         "**To get started (free):**\n"
         "1. FMP key: https://site.financialmodelingprep.com/developer/docs/dashboard\n"
         "2. Add to Streamlit secrets as `FMP_API_KEY = \"your_key\"`\n"
-        "3. (For stock details) also add a free Finnhub key as `FINNHUB_API_KEY = \"your_key\"` from https://finnhub.io/register\n"
-        "4. Reload."
+        "3. Reload."
     )
     st.stop()
 
@@ -685,7 +679,7 @@ else:
 
 st.markdown("---")
 st.caption(
-    "📚 Educational tool, not financial advice. Data from FMP (movers) and Finnhub (stock details), "
+    "📚 Educational tool, not financial advice. Data from Financial Modeling Prep, "
     "and may be delayed. Metrics and 'healthy ranges' are general guidance — compare within a "
     "company's own industry, and make your own decisions."
 )
