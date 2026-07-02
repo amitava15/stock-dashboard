@@ -1451,25 +1451,137 @@ def render_technicals(symbol):
 # AI ANALYSIS  (optional — calls Claude to explain the whole page in plain English)
 # ===========================================================================
 ANALYSIS_SYSTEM = (
-    "You are a patient financial educator helping someone understand a stock research dashboard. "
-    "You will receive structured data about ONE company: fundamentals and their multi-year "
-    "trajectory, cash generation, valuation versus its own history and growth, analyst "
-    "expectations, upcoming/last earnings, and light technicals.\n\n"
-    "Write a clear, plain-English analysis that:\n"
-    "1. Explains in simple terms what each group of numbers represents (assume the reader is smart "
-    "but NOT a finance expert — define jargon the first time you use it).\n"
-    "2. Ties it into one coherent picture: is the business improving, is it generating real cash, "
-    "does the valuation look demanding or reasonable versus its own history and growth, what do "
-    "analysts expect, and where does the price sit technically.\n"
-    "3. Surfaces tensions and things to watch (e.g. strong growth but a rich valuation, or a big "
-    "gap between accounting profit and cash flow), framed as questions the reader should consider.\n\n"
-    "STRICT RULES:\n"
-    "- Do NOT tell the reader to buy, sell, or hold, and do NOT predict prices or set targets.\n"
-    "- Do NOT invent numbers that aren't in the data. If something is marked unavailable, say so.\n"
-    "- Use short sections with plain headers and short paragraphs.\n"
-    "- End with one line noting this is educational, not financial advice, and that AI can make "
-    "mistakes, so numbers should be verified against primary sources."
+    "You are an equity research assistant for a personal stock-research dashboard.\n\n"
+    "Your job is to analyze the provided company and stock data and generate a plain-English "
+    "investment research summary for a non-expert investor.\n\n"
+    "Important rules:\n"
+    "- Do NOT give personalized financial advice.\n"
+    "- Do NOT say \"you should buy\" or \"you should sell.\"\n"
+    "- You may give a research view such as: \"Buyable on pullback,\" \"Hold / watch,\" "
+    "\"Avoid for now,\" \"High-risk growth candidate,\" or \"Strong business but valuation stretched.\"\n"
+    "- Explain every major metric in simple language.\n"
+    "- Tie the metrics together into a clear, insightful recommendation framework.\n"
+    "- Be honest about missing, stale, contradictory, or suspicious data.\n"
+    "- If data looks wrong or extreme, flag it clearly before drawing conclusions.\n"
+    "- Distinguish between company quality and stock buyability. A great company can still be a "
+    "poor buy if the price is too high."
 )
+
+# The user-message template. {STOCK_DATA} and {TICKER} are filled in at call time
+# (via str.replace, so the literal braces elsewhere are safe).
+ANALYSIS_TEMPLATE = """Input data:
+{STOCK_DATA}
+
+Generate the analysis in the following structure:
+
+# {TICKER} — Plain-English Investment Research Summary
+
+## 1. Bottom-line research view
+
+Start with a short conclusion in plain English.
+
+Use one of these styles:
+- "Strong business, but valuation looks stretched."
+- "Improving turnaround, but still risky."
+- "High-quality compounder, buyable only at a fair price."
+- "Momentum is strong, but the stock may already price in a lot of good news."
+- "Weak fundamentals; not attractive unless the turnaround becomes clearer."
+
+Include:
+- Research stance: Buyable / Hold / Watchlist / Avoid for now / Trim if overexposed
+- Time horizon: short-term setup vs long-term thesis
+- Confidence level: Low / Medium / High
+- Main reason for the stance
+
+## 2. What business are we buying?
+
+Explain what the company actually does: business model, main products/services, industry, and
+whether the business is cyclical, stable, high-growth, commodity-like, subscription-like, or
+capital-intensive — and why that matters for interpreting the numbers. Explain it as if the reader
+has never analyzed the company before.
+
+## 3. Business trajectory: is the company getting better or worse?
+
+Analyze multi-year trends in revenue, EPS, gross margin, operating margin, net margin, return on
+equity, and debt. For each important metric: (1) explain what it means, (2) state what the data
+shows, (3) translate it into an insight. Answer: is revenue growing consistently or cyclically? Are
+profits improving or deteriorating? Are margins expanding or shrinking? Is the company becoming more
+efficient? Is debt rising faster than the business?
+
+## 4. Cash generation: does profit turn into real cash?
+
+Analyze operating cash flow, free cash flow, FCF margin, FCF per share, FCF yield, and capex if
+available. Explain that free cash flow is the cash left after running the business and investing to
+keep growing; strong earnings with weak FCF can mean heavy investment, working-capital pressure, or
+lower earnings quality. Answer: is FCF positive and improving? Does it support the earnings story?
+Is the company spending heavily to grow? Is the FCF yield attractive relative to market cap?
+
+## 5. Valuation: is the stock cheap, fair, or expensive?
+
+Analyze P/E, forward P/E, PEG, EV/EBITDA, price/sales, FCF yield, current valuation vs 5-year
+median, and valuation relative to growth. Explain each simply. Do NOT call a stock cheap just
+because PEG is low. If growth is temporarily inflated by a rebound from losses, explain that.
+Compare current multiples to historical medians and say whether the market is already pricing in a
+lot of good news. End with a valuation read: Cheap / Reasonable / Premium but justified / Stretched /
+Very expensive (expectation-heavy).
+
+## 6. Analyst expectations: what do professionals think?
+
+Analyze buy/hold/sell counts, average price target, low and high targets, implied upside/downside,
+and earnings/revenue estimates. Note that consensus is expert sentiment, price targets are not
+guarantees, and analysts can be late, overly optimistic, or clustered. Answer: are analysts broadly
+bullish, mixed, or cautious? Is the average target meaningfully above the current price? Is the low
+target below it? Are expectations already very high?
+
+## 7. Earnings and upcoming catalysts
+
+Analyze the next earnings date, days until it, EPS estimate, last EPS actual vs estimate, last
+revenue actual vs estimate, and any guidance/filings if available. Note that a company can beat and
+still fall if expectations were higher. Answer: did it beat or miss last quarter? Was the beat
+meaningful? Are next-quarter expectations high? What could move the stock next?
+
+## 8. Price context and timing
+
+Analyze current price, distance from 52-week high and low, 50-day and 200-day moving averages, RSI,
+volume vs average, and beta. Explain the 50-day (medium-term trend), 200-day (long-term trend), RSI
+(short-term overbought/oversold; ~50 is neutral), and beta (volatility vs the market). Answer: is
+the stock extended or beaten down? Is momentum strong or weakening? Is it near a high after a big
+run? Is this a calm entry or a chase? How volatile is it likely to be?
+
+## 9. Financial health and risk
+
+Analyze gross margin, net margin, ROE, debt/equity, cash and debt if available, beta, and any
+industry-specific risks. Explain that strong margins show pricing power or efficiency, high ROE
+means strong profit on shareholder capital, low debt/equity means less balance-sheet stress, and
+high beta means larger swings. Identify the biggest risks (valuation, cyclical, demand slowdown,
+margin compression, debt/capex, customer concentration, regulatory/geopolitical, execution,
+expectations).
+
+## 10. Bull case, bear case, and what would change the view
+
+Bull case: what has to go right for the stock to work? Bear case: what could cause it to fall? What
+would change the view: what data would make it more attractive, and what would make it less
+attractive? Be specific and use metrics.
+
+## 11. Final tied-together recommendation framework
+
+Give a clear research stance in this format:
+
+Research stance:
+- For existing holders:
+- For new buyers:
+- For risk-averse investors:
+- For aggressive growth investors:
+
+Then a final one-sentence summary.
+
+Before writing the final summary, check the data for anomalies:
+- Is the price or market cap unusually different from recent known values?
+- Are growth rates distorted by a prior negative year?
+- Are valuation ratios missing, stale, or mathematically inconsistent?
+- Are analyst targets split-adjusted consistently with the current price?
+- Are any fields marked N/A?
+If there are anomalies, include a short "Data quality notes" section before the recommendation."""
 
 
 def _fmt_series(years, vals, fmt):
@@ -1489,8 +1601,13 @@ def _fmt_series(years, vals, fmt):
     return ", ".join(out) if out else "unavailable"
 
 
-def _analysis_payload(symbol):
-    """Assemble everything the dashboard knows into a compact text brief for Claude."""
+def _analysis_json(symbol):
+    """Assemble everything the dashboard knows into the structured JSON the
+    research prompt consumes. Keeps the requested field names, and adds the
+    margin/ROE/debt and cash-generation history + valuation-vs-median context
+    the prompt's sections need. Revenues/FCF/debt in billions; percent fields
+    stay percent-scaled; None where unavailable."""
+    import json as _json
     q, prof, m = get_quote(symbol), get_company_profile(symbol), get_key_metrics(symbol)
     tr, cash = get_trajectory_annual(symbol), get_cash_annual(symbol)
     val, an, ea, tech = (get_valuation_growth(symbol), get_analyst(symbol),
@@ -1498,94 +1615,127 @@ def _analysis_payload(symbol):
     ty, tm = tr["years"], tr["metrics"]
     cy, cm = cash["years"], cash["metrics"]
     cur, gro, hist = val["current"], val["growth"], val["history"]
-    L = []
-    L.append(f"COMPANY: {prof.get('name') or q.get('name') or symbol} ({symbol})")
-    L.append(f"Industry: {prof.get('industry') or '?'} | Sector: {prof.get('sector') or '?'} "
-             f"| Exchange: {q.get('exchange') or '?'}")
-    L.append(f"Price {money(q.get('price'))} | Market cap {big_money(q.get('market_cap'))} "
-             f"| 52-wk {money(q.get('week_low'))}–{money(q.get('week_high'))}")
+    g, tgt = an["grades"], an["target"]
+    nxt, last = ea.get("next") or {}, ea.get("last") or {}
 
-    L.append("\n[BUSINESS TRAJECTORY, annual]")
-    L.append(f"Revenue: {_fmt_series(ty, tm.get('revenue'), 'money')}")
-    L.append(f"EPS diluted: {_fmt_series(ty, tm.get('eps'), 'eps')}")
-    L.append(f"Gross margin: {_fmt_series(ty, tm.get('gross_margin'), 'pct')}")
-    L.append(f"Operating margin: {_fmt_series(ty, tm.get('op_margin'), 'pct')}")
-    L.append(f"Net margin: {_fmt_series(ty, tm.get('net_margin'), 'pct')}")
-    L.append(f"ROE: {_fmt_series(ty, tm.get('roe'), 'pct')}")
-    L.append(f"Free cash flow: {_fmt_series(ty, tm.get('fcf'), 'money')}")
-    L.append(f"Total debt: {_fmt_series(ty, tm.get('debt'), 'money')}")
+    def rnd(v, nd=2):
+        f = to_float(v)
+        if f is None:
+            return None
+        return int(round(f)) if nd == 0 else round(f, nd)
 
-    L.append("\n[CASH GENERATION, annual]")
-    L.append(f"FCF: {_fmt_series(cy, cm.get('fcf'), 'money')}")
-    L.append(f"FCF margin: {_fmt_series(cy, cm.get('fcf_margin'), 'pct')}")
-    L.append(f"FCF per share: {_fmt_series(cy, cm.get('fcf_ps'), 'eps')}")
-    L.append(f"FCF yield: {_fmt_series(cy, cm.get('fcf_yield'), 'pct')}")
+    def bil(v):
+        f = to_float(v)
+        return round(f / 1e9, 2) if f is not None else None
 
-    L.append("\n[VALUATION vs GROWTH — current TTM]")
-    L.append(f"P/E {num(cur.get('pe'))} | Forward P/E {num(cur.get('forward_pe'))} "
-             f"| PEG {num(cur.get('peg'))} | EV/EBITDA {num(cur.get('ev_ebitda'))} "
-             f"| P/S {num(cur.get('ps'))} | FCF yield {pct(cur.get('fcf_yield'))}")
-    L.append(f"Growth YoY — revenue {pct(gro.get('revenue'))}, EPS {pct(gro.get('eps'))}, "
-             f"FCF {pct(gro.get('fcf'))}")
-    L.append(f"Vs 5-yr median — P/E now {num(hist['pe']['now'])} vs {num(hist['pe']['median'])}; "
-             f"EV/EBITDA {num(hist['ev']['now'])} vs {num(hist['ev']['median'])}; "
-             f"P/S {num(hist['ps']['now'])} vs {num(hist['ps']['median'])}")
+    def fy_map(years, vals, scale=1.0, nd=2):
+        out = {}
+        for y, v in zip(years or [], vals or []):
+            f = to_float(v)
+            if f is None:
+                continue
+            key = f"FY{str(y)[2:]}" if len(str(y)) == 4 else str(y)
+            out[key] = round(f / scale, nd)
+        return out
 
-    L.append("\n[ANALYST EXPECTATIONS]")
-    g = an["grades"]
-    L.append(f"Consensus {an.get('consensus') or '?'} "
-             f"(strongBuy {int(g.get('strongBuy') or 0)}, buy {int(g.get('buy') or 0)}, "
-             f"hold {int(g.get('hold') or 0)}, sell {int(g.get('sell') or 0)}, "
-             f"strongSell {int(g.get('strongSell') or 0)})")
-    tg = an["target"]
-    L.append(f"Price target low {money(tg.get('low'))} / avg {money(tg.get('avg'))} / "
-             f"high {money(tg.get('high'))} | implied {pct(tg.get('upside'))} vs price")
-    fw = an["forward"]
-    L.append(f"Forward est ({fw.get('year') or '?'}): revenue {big_money(fw.get('revenue'))}, "
-             f"EPS {money(fw.get('eps'))}")
+    def med(d):
+        return {"now": rnd(d.get("now")), "median": rnd(d.get("median"))}
 
-    L.append("\n[EARNINGS]")
-    nxt, last = ea.get("next"), ea.get("last")
-    if nxt:
-        L.append(f"Next earnings {nxt.get('date')} ({nxt.get('days')} days away), "
-                 f"EPS est {money(nxt.get('eps_est'))}")
-    if last:
-        L.append(f"Last earnings {last.get('date')}: EPS {money(last.get('eps_actual'))} vs est "
-                 f"{money(last.get('eps_est'))} ({_beat_str(last.get('eps_surprise')) or 'n/a'}); "
-                 f"revenue {big_money(last.get('rev_actual'))} vs est {big_money(last.get('rev_est'))} "
-                 f"({_beat_str(last.get('rev_surprise')) or 'n/a'})")
+    mc = to_float(q.get("market_cap"))
+    mc_str = None
+    if mc is not None:
+        for size, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+            if abs(mc) >= size:
+                mc_str = f"{mc / size:.2f}{unit}"
+                break
+        else:
+            mc_str = f"{mc:.0f}"
 
-    L.append("\n[PRICE CONTEXT / TECHNICALS]")
-    L.append(f"50-day MA {money(tech.get('ma50'))} (price is "
-             f"{'above' if tech.get('above_50') else 'below' if tech.get('above_50') is not None else '?'}); "
-             f"200-day MA {money(tech.get('ma200'))} (price is "
-             f"{'above' if tech.get('above_200') else 'below' if tech.get('above_200') is not None else '?'})")
-    L.append(f"RSI(14) {num(tech.get('rsi'), 0)} | from 52-wk high {pct(tech.get('dist_high'))} | "
-             f"from 52-wk low {pct(tech.get('dist_low'))} | volume vs avg "
-             f"{num(tech.get('vol_ratio'))}x")
+    data = {
+        "ticker": symbol,
+        "company": prof.get("name") or q.get("name") or symbol,
+        "sector": prof.get("sector") or prof.get("industry"),
+        "price": rnd(q.get("price")),
+        "daily_change_pct": rnd(q.get("change_pct")),
+        "market_cap": mc_str,
+        "revenue_history": fy_map(ty, tm.get("revenue"), scale=1e9, nd=1),
+        "eps_history": fy_map(ty, tm.get("eps"), scale=1.0, nd=2),
+        "gross_margin_pct_history": fy_map(ty, tm.get("gross_margin"), scale=1.0, nd=1),
+        "operating_margin_pct_history": fy_map(ty, tm.get("op_margin"), scale=1.0, nd=1),
+        "net_margin_pct_history": fy_map(ty, tm.get("net_margin"), scale=1.0, nd=1),
+        "roe_pct_history": fy_map(ty, tm.get("roe"), scale=1.0, nd=1),
+        "total_debt_history_billions": fy_map(ty, tm.get("debt"), scale=1e9, nd=2),
+        "cash_generation_history": {
+            "fcf_billions": fy_map(cy, cm.get("fcf"), scale=1e9, nd=2),
+            "fcf_margin_pct": fy_map(cy, cm.get("fcf_margin"), scale=1.0, nd=1),
+            "fcf_per_share": fy_map(cy, cm.get("fcf_ps"), scale=1.0, nd=2),
+            "fcf_yield_pct": fy_map(cy, cm.get("fcf_yield"), scale=1.0, nd=2),
+        },
+        "valuation": {
+            "pe": rnd(cur.get("pe")),
+            "forward_pe": rnd(cur.get("forward_pe")),
+            "peg": rnd(cur.get("peg")),
+            "ev_ebitda": rnd(cur.get("ev_ebitda")),
+            "price_sales": rnd(cur.get("ps")),
+            "fcf_yield": rnd(cur.get("fcf_yield")),
+            "vs_5yr_median": {
+                "pe": med(hist.get("pe", {})),
+                "ev_ebitda": med(hist.get("ev", {})),
+                "price_sales": med(hist.get("ps", {})),
+            },
+        },
+        "growth_yoy_pct": {
+            "revenue": rnd(gro.get("revenue")),
+            "eps": rnd(gro.get("eps")),
+            "fcf": rnd(gro.get("fcf")),
+        },
+        "analyst_view": {
+            "buy": int((to_float(g.get("strongBuy")) or 0) + (to_float(g.get("buy")) or 0)),
+            "hold": int(to_float(g.get("hold")) or 0),
+            "sell": int((to_float(g.get("sell")) or 0) + (to_float(g.get("strongSell")) or 0)),
+            "average_price_target": rnd(tgt.get("avg")),
+            "low_price_target": rnd(tgt.get("low")),
+            "high_price_target": rnd(tgt.get("high")),
+            "implied_upside_pct": rnd(tgt.get("upside")),
+        },
+        "earnings": {
+            "next_earnings_date": nxt.get("date"),
+            "days_until_earnings": rnd(nxt.get("days"), 0),
+            "eps_estimate": rnd(nxt.get("eps_est")),
+            "last_eps_actual": rnd(last.get("eps_actual")),
+            "last_eps_estimate": rnd(last.get("eps_est")),
+            "last_revenue_actual": bil(last.get("rev_actual")),
+            "last_revenue_estimate": bil(last.get("rev_est")),
+        },
+        "technicals": {
+            "fifty_day_ma": rnd(tech.get("ma50")),
+            "two_hundred_day_ma": rnd(tech.get("ma200")),
+            "rsi_14": rnd(tech.get("rsi"), 0),
+            "from_52_week_high_pct": rnd(tech.get("dist_high")),
+            "from_52_week_low_pct": rnd(tech.get("dist_low")),
+            "volume_vs_avg": rnd(tech.get("vol_ratio")),
+            "beta": rnd(m.get("beta") or prof.get("beta")),
+        },
+    }
+    return _json.dumps(data, indent=2)
 
-    L.append("\n[FILINGS] Full SEC filings (10-K/10-Q/8-K) are available on EDGAR; not included as "
-             "raw text here. The figures above are derived from those filings.")
-    return "\n".join(L)
 
-
-def generate_ai_analysis(payload_text):
+def generate_ai_analysis(symbol, stock_json):
     """Call Claude's Messages API. Returns (text, error). Uses raw HTTP so no extra
     dependency is needed. Reads the key from Streamlit secrets."""
     key = st.secrets.get("ANTHROPIC_API_KEY", "")
     if not key:
         return None, "no_key"
+    user_msg = ANALYSIS_TEMPLATE.replace("{STOCK_DATA}", stock_json).replace("{TICKER}", symbol)
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": ANTHROPIC_MODEL, "max_tokens": 2500,
+            json={"model": ANTHROPIC_MODEL, "max_tokens": 8000,
                   "system": ANALYSIS_SYSTEM,
-                  "messages": [{"role": "user", "content":
-                                "Here is the dashboard data. Please write the plain-English "
-                                "analysis.\n\n" + payload_text}]},
-            timeout=90,
+                  "messages": [{"role": "user", "content": user_msg}]},
+            timeout=150,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1615,13 +1765,16 @@ def render_ai_analysis(symbol):
         )
         return
 
-    st.caption("Claude reads everything above and explains — in plain English — what each metric "
-               "means and how it ties together. Educational only, not financial advice. "
-               "Each run costs a few cents of API usage.")
+    st.caption("Claude reads all the data on this stock and writes a structured, plain-English "
+               "research summary — what each metric means, whether the business is improving, "
+               "whether the valuation is demanding, and a bull/bear framework. It gives a research "
+               "*view* (e.g. Buyable / Hold / Watchlist / Avoid), not personalized advice. "
+               "Educational only. Each run is a detailed report, so it costs a bit more API usage "
+               "than a short answer — typically a few cents.")
     cache = st.session_state.setdefault("ai_analysis", {})
     if st.button("✨ Generate AI analysis", key=f"ai_btn_{symbol}"):
-        with st.spinner("Claude is reading the data…"):
-            text, err = generate_ai_analysis(_analysis_payload(symbol))
+        with st.spinner("Claude is reading the data and writing the report…"):
+            text, err = generate_ai_analysis(symbol, _analysis_json(symbol))
         if err:
             st.error(f"Analysis failed ({err}). Check the API key, and if it mentions the model, "
                      "set `ANTHROPIC_MODEL` in your secrets to a current model name.")
@@ -1630,8 +1783,10 @@ def render_ai_analysis(symbol):
 
     if cache.get(symbol):
         st.markdown(cache[symbol])
-        st.caption("⚠️ AI-generated — it explains the data shown and may contain errors. It does not "
-                   "predict prices or recommend buying or selling. Verify against primary sources.")
+        st.caption("⚠️ AI-generated research view for education — **not** personalized financial "
+                   "advice, and it may contain errors. Any stance (Buyable / Hold / Avoid, etc.) is "
+                   "a research framing, not a recommendation to act. Verify against primary sources "
+                   "and make your own decision.")
 
 
 # ===========================================================================
@@ -2183,8 +2338,8 @@ def show_ticker(symbol):
     _render_stock_header(symbol, name, industry, exchange, quote)
     render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
 
-    tab_overview, tab_business, tab_valuation, tab_market, tab_notes = st.tabs(
-        ["Overview", "Business", "Valuation", "Market", "Notes"]
+    tab_overview, tab_business, tab_valuation, tab_market, tab_notes, tab_ai = st.tabs(
+        ["Overview", "Business", "Valuation", "Market", "Notes", "AI"]
     )
 
     # ---------------- OVERVIEW: the essentials + price + AI summary ----------------
@@ -2207,9 +2362,6 @@ def show_ticker(symbol):
 
         section("Price", "the trend over time")
         render_price_chart(symbol)
-
-        section("AI Analysis", "the whole picture, in plain English")
-        render_ai_analysis(symbol)
 
     # ---------------- BUSINESS: fundamentals over time ----------------
     with tab_business:
@@ -2264,6 +2416,11 @@ def show_ticker(symbol):
         if not _PDF_OK:
             st.caption("📄 PDF export needs the **reportlab** and **matplotlib** packages — add them to "
                        "`requirements.txt` and redeploy, and a floating **PDF** button appears bottom-left.")
+
+    # ---------------- AI ANALYSIS (its own tab, last) ----------------
+    with tab_ai:
+        section("AI Analysis", "the whole picture, in plain English")
+        render_ai_analysis(symbol)
 
 
 # ===========================================================================
