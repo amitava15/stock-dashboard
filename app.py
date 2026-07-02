@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -701,7 +701,7 @@ def get_forward_estimates(symbol, n=3):
     analyst-estimates (annual); empty list if the endpoint returns nothing."""
     import datetime as _dt
     sym = symbol.upper()
-    rows = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12") or []
+    rows = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=10") or []
     price = to_float(pick(_fmp_quote(sym), "price"))
     today = _dt.date.today()
     fut = []
@@ -779,7 +779,7 @@ def get_valuation_growth(symbol, years=6):
     # Forward P/E from analyst estimates (may be gated -> stays None).
     fwd_pe = None
     price = to_float(pick(q, "price"))
-    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12")
+    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=10")
     row = _nearest_future_estimate(est)
     if row and price is not None:
         eps_est = to_float(pick(row, "epsAvg", "estimatedEpsAvg", "estimatedEps", "epsEstimated"))
@@ -804,7 +804,7 @@ def get_analyst(symbol):
     sym = symbol.upper()
     gr = _fmp_first(f"grades-consensus?symbol={sym}")
     pt = _fmp_first(f"price-target-consensus?symbol={sym}")
-    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=12")
+    est = _fmp_statement(f"analyst-estimates?symbol={sym}&period=annual&limit=10")
     price = to_float(pick(_fmp_quote(sym), "price"))
     fwd = _nearest_future_estimate(est) or {}
     target = to_float(pick(pt, "targetConsensus"))
@@ -829,7 +829,7 @@ def get_earnings_context(symbol):
     """Next earnings date, last actual-vs-estimate, and CIK for EDGAR links."""
     import datetime as _dt
     sym = symbol.upper()
-    rows = _fmp_statement(f"earnings?symbol={sym}&limit=12")
+    rows = _fmp_statement(f"earnings?symbol={sym}&limit=10")
     today = _dt.date.today()
 
     def parse(r):
@@ -1326,7 +1326,7 @@ def render_valuation_growth(symbol):
                        "earnings are expected to fall, so the stock is more expensive against future "
                        "profits than trailing ones suggest.")
     else:
-        _rows, _status, _err = _fmp_probe(f"analyst-estimates?symbol={symbol.upper()}&period=annual&limit=12")
+        _rows, _status, _err = _fmp_probe(f"analyst-estimates?symbol={symbol.upper()}&period=annual&limit=10")
         import datetime as _d
         _future = 0
         for _r in _rows:
