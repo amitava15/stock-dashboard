@@ -404,6 +404,14 @@ def big_count(v):
     return f"{v:,.0f}"
 
 
+def money_range(a, b):
+    """A 'low – high' price range. Escapes '$' so st.metric doesn't read a
+    '$...$' pair as LaTeX math (which garbles the display)."""
+    if to_float(a) is None or to_float(b) is None:
+        return "N/A"
+    return f"{money(a)} – {money(b)}".replace("$", r"\$")
+
+
 def metric_tile(col, label, value, explainer_key, note=None):
     """A metric with a small '?' tooltip (hover on desktop, tap on mobile)."""
     help_text = EXPLAINERS.get(explainer_key, "")
@@ -535,6 +543,7 @@ def show_ticker(symbol):
 
     profile = get_company_profile(symbol)
     metrics = get_key_metrics(symbol)
+    st.session_state.last_symbol = symbol   # seed the Compare view
 
     name = profile.get("name") or quote.get("name") or symbol
     industry = profile.get("industry")
@@ -556,7 +565,7 @@ def show_ticker(symbol):
     metric_tile(c2, "Market Cap", big_money(profile.get("market_cap") or quote.get("market_cap")), "market_cap")
 
     low, high = quote.get("week_low"), quote.get("week_high")
-    range_val = f"{money(low)} – {money(high)}" if to_float(low) and to_float(high) else "N/A"
+    range_val = money_range(low, high)
     range_note = None
     p, lo, hi = to_float(price), to_float(low), to_float(high)
     if None not in (p, lo, hi) and hi > lo:
@@ -590,7 +599,7 @@ def show_ticker(symbol):
     c1, c2, c3 = st.columns(3)
     metric_tile(c1, "Beta", num(metrics.get("beta")), "beta")
     with c2:
-        st.metric("Day Range", f"{money(quote.get('day_low'))} – {money(quote.get('day_high'))}")
+        st.metric("Day Range", money_range(quote.get("day_low"), quote.get("day_high")))
     with c3:
         st.metric("Prev Close", money(quote.get("prev_close")))
 
@@ -601,6 +610,184 @@ def show_ticker(symbol):
                  placeholder="e.g. Strong margins but debt looks high for the sector — check latest earnings before deciding.")
 
     st.caption("ℹ️ Hover the **?** on any metric for a plain-English explanation. Some metrics (PEG, EV/EBITDA) may show N/A on the free data tier — the app stays fully usable without them.")
+
+
+# ===========================================================================
+# COMPARISON VIEW  (normalized price chart + side-by-side metrics table)
+# ===========================================================================
+# Editorial categorical palette for multiple series (readable on warm paper).
+SERIES_COLORS = ["#23231E", "#2F6B4F", "#A24A38", "#3A5A78", "#8A6D3B", "#6B4E71"]
+
+
+def _parse_tickers(raw, cap=5):
+    """Split a free-text field ('NVDA, amd; avgo') into clean, de-duped symbols."""
+    seen, out = set(), []
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        t = chunk.strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _rebased_series(symbol, days):
+    """Price history rebased so the window starts at 0% -> DataFrame[date, pct]."""
+    df = get_price_history(symbol)
+    if df.empty:
+        return None
+    cutoff = df["date"].max() - pd.Timedelta(days=days)
+    d = df[df["date"] >= cutoff]
+    if len(d) < 2:
+        d = df
+    base = d["close"].iloc[0]
+    if not base:
+        return None
+    out = d[["date"]].copy()
+    out["pct"] = (d["close"] / base - 1.0) * 100.0
+    return out
+
+
+def _comparison_chart(symbols, days, include_spy):
+    """Overlay each ticker's % change on one axis. Returns (figure, missing[])."""
+    fig = go.Figure()
+    plotted, missing = [], []
+
+    for i, sym in enumerate(symbols):
+        s = _rebased_series(sym, days)
+        if s is None or s.empty:
+            missing.append(sym)
+            continue
+        fig.add_trace(go.Scatter(
+            x=s["date"], y=s["pct"], mode="lines", name=sym,
+            line=dict(color=SERIES_COLORS[i % len(SERIES_COLORS)], width=2),
+            hovertemplate=f"<b>{sym}</b>  %{{x|%b %-d, %Y}}   %{{y:+.1f}}%<extra></extra>",
+        ))
+        plotted.append(sym)
+
+    spy_plotted = False
+    if include_spy:
+        s = _rebased_series("SPY", days)
+        if s is not None and not s.empty:
+            fig.add_trace(go.Scatter(
+                x=s["date"], y=s["pct"], mode="lines", name="S&P 500",
+                line=dict(color=MUTED, width=1.5, dash="dash"),
+                hovertemplate="<b>S&P 500</b>  %{x|%b %-d, %Y}   %{y:+.1f}%<extra></extra>",
+            ))
+            spy_plotted = True
+        else:
+            missing.append("SPY")
+
+    if not plotted and not spy_plotted:
+        return None, missing
+
+    fig.add_hline(y=0, line=dict(color=LINE, width=1))
+    fig.update_layout(
+        height=380,
+        margin=dict(l=6, r=6, t=6, b=6),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Sans, sans-serif", color=MUTED, size=12),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor=PAPER, bordercolor=LINE,
+                        font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
+                    font=dict(family="IBM Plex Sans, sans-serif", color=INK, size=12),
+                    bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(showgrid=False, showline=False, zeroline=False, ticks="",
+                   tickfont=dict(color=MUTED, size=11), fixedrange=True),
+        yaxis=dict(showgrid=True, gridcolor=LINE, griddash="dot",
+                   showline=False, zeroline=False, ticks="", ticksuffix="%",
+                   tickfont=dict(color=MUTED, size=11), fixedrange=True),
+    )
+    return fig, missing
+
+
+def _metrics_column(symbol):
+    """Formatted TTM metric values for one ticker (a table column), or None."""
+    q = get_quote(symbol)
+    if not q:
+        return None
+    m = get_key_metrics(symbol)
+    p = get_company_profile(symbol)
+    return {
+        "Price": money(q.get("price")),
+        "Market Cap": big_money(q.get("market_cap") or p.get("market_cap")),
+        "P/E (TTM)": num(m.get("pe")),
+        "PEG": num(m.get("peg")),
+        "EV / EBITDA": num(m.get("ev_ebitda")),
+        "Net Margin": pct(m.get("net_margin_pct")),
+        "Gross Margin": pct(m.get("gross_margin_pct")),
+        "Debt / Equity": num(m.get("debt_to_equity")),
+        "ROE": pct(m.get("roe_pct")),
+        "Beta": num(m.get("beta")),
+    }
+
+
+def show_comparison():
+    section("Compare", "side by side")
+    st.caption("Enter 2–5 tickers to see relative performance and fundamentals side by side. "
+               "**You** decide what the differences mean.")
+
+    default = st.session_state.get("last_symbol", "")
+    raw = st.text_input("Tickers to compare (comma-separated)",
+                        value=st.session_state.get("cmp_tickers", default),
+                        key="cmp_tickers",
+                        placeholder="e.g.  NVDA, AMD, AVGO, INTC")
+    include_spy = st.checkbox("Compare price to the S&P 500 (SPY)", value=True, key="cmp_spy")
+
+    tickers = _parse_tickers(raw, cap=5)
+    if not tickers:
+        st.info("Enter at least one ticker above to get started — e.g. **NVDA, AMD, AVGO**.")
+        return
+
+    # ---- Relative performance chart ----
+    section("Relative Performance", "rebased to % change")
+    options = list(RANGE_DAYS.keys())
+    picker = getattr(st, "segmented_control", None)
+    if picker:
+        choice = picker("Range", options, default="1Y",
+                        key="cmp_range", label_visibility="collapsed")
+    else:
+        choice = st.radio("Range", options, index=3, horizontal=True,
+                          key="cmp_range", label_visibility="collapsed")
+    choice = choice or "1Y"
+
+    st.caption("Every line starts at 0%, so you're comparing growth over the period — not share "
+               "prices. A $30 stock and a $1,000 stock sit on the same footing here.")
+
+    with st.spinner("Loading price history…"):
+        fig, missing = _comparison_chart(tickers, RANGE_DAYS[choice], include_spy)
+    if fig is None:
+        st.warning("Couldn't load price history for those tickers on the current plan. "
+                   "Check the symbols — try US-listed stocks like **NVDA, AMD**.")
+        return
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    if missing:
+        st.caption("Couldn't chart: " + ", ".join(f"**{m}**" for m in missing) +
+                   " — likely not covered on the current plan (funds, indices, or non-US listings).")
+
+    # ---- Metrics table ----
+    section("The Numbers", "fundamentals side by side")
+    st.caption("Trailing-twelve-month figures. The S&P 500 is a benchmark on the chart only — "
+               "the fundamentals below are for the companies you entered.")
+    with st.spinner("Loading fundamentals…"):
+        data, no_data = {}, []
+        for t in tickers:
+            col = _metrics_column(t)
+            if col:
+                data[t] = col
+            else:
+                no_data.append(t)
+    if data:
+        st.dataframe(pd.DataFrame(data), use_container_width=True)
+        st.caption("ℹ️ Some cells may show N/A on the current tier. Compare within the same "
+                   "industry — a 'good' P/E or margin in one sector can be poor in another.")
+    else:
+        st.warning("No fundamental data came back for those tickers.")
+    if no_data:
+        st.caption("No fundamentals for: " + ", ".join(f"**{m}**" for m in no_data) + ".")
 
 
 # ===========================================================================
@@ -618,10 +805,15 @@ def _view_movers(mover):
     st.session_state.view = {"kind": "movers", "mover": mover}
 
 
+def _view_compare():
+    st.session_state.view = {"kind": "compare"}
+
+
 # on_click callbacks (below) run at the start of the rerun, before this body,
 # so `view` already reflects the button the person just clicked — no stale state.
 view = st.session_state.get("view", {"kind": "movers", "mover": "gainers"})
 active_mover = view.get("mover") if view.get("kind") == "movers" else None
+on_compare = view.get("kind") == "compare"
 
 # --- Search ---
 search_term = st.sidebar.text_input("🔎 Search company or ticker",
@@ -660,6 +852,13 @@ for _label, _key in [("Top Gainers", "gainers"), ("Top Losers", "losers"), ("Mos
                       type="primary" if active_mover == _key else "secondary",
                       on_click=_view_movers, args=(_key,))
 
+# --- Compare ---
+st.sidebar.markdown("---")
+st.sidebar.caption("Compare")
+st.sidebar.button("Compare stocks  →", use_container_width=True,
+                  type="primary" if on_compare else "secondary",
+                  on_click=_view_compare)
+
 st.title("Stock Research Dashboard")
 
 if not FMP_KEY:
@@ -674,6 +873,8 @@ if not FMP_KEY:
 
 if view.get("kind") == "stock":
     show_ticker(view["symbol"])
+elif view.get("kind") == "compare":
+    show_comparison()
 else:
     show_movers(view.get("mover", "gainers"))
 
