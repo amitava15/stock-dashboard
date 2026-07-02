@@ -400,9 +400,10 @@ def section(title, kicker=""):
 # Editorial palette (kept in sync with the CSS block up top)
 INK, PAPER, MUTED, LINE = "#23231E", "#FCFBF8", "#7A7970", "#E8E6DE"
 POS, NEG = "#2F6B4F", "#A24A38"
-RANGE_DAYS = {"1M": 30, "6M": 182, "1Y": 365, "5Y": 365 * 5}
-RANGE_WORDS = {"1M": "over the past month", "6M": "over the past 6 months",
-               "1Y": "over the past year", "5Y": "over the past 5 years"}
+RANGE_DAYS = {"1W": 7, "1M": 30, "6M": 182, "1Y": 365, "5Y": 365 * 5}
+RANGE_WORDS = {"1W": "over the past week", "1M": "over the past month",
+               "6M": "over the past 6 months", "1Y": "over the past year",
+               "5Y": "over the past 5 years"}
 
 
 def render_price_chart(symbol):
@@ -418,7 +419,7 @@ def render_price_chart(symbol):
         choice = picker("Range", options, default="1Y",
                         key=f"range_{symbol}", label_visibility="collapsed")
     else:
-        choice = st.radio("Range", options, index=2, horizontal=True,
+        choice = st.radio("Range", options, index=3, horizontal=True,
                           key=f"range_{symbol}", label_visibility="collapsed")
     choice = choice or "1Y"
 
@@ -613,8 +614,17 @@ def show_ticker(symbol):
 st.sidebar.title("Stock Research")
 st.sidebar.caption("Aggregate the data. Understand the metrics. **You** decide.")
 
+
+def _set_mode(mode):
+    # Remember whether the person last used Search or Browse, so a click on one
+    # doesn't get ignored because the other still holds a value.
+    st.session_state.nav_mode = mode
+
+
 search_term = st.sidebar.text_input("🔎 Search company or ticker",
-                                     placeholder="e.g. Micron  or  MU").strip()
+                                     placeholder="e.g. Micron  or  MU",
+                                     key="search_box",
+                                     on_change=_set_mode, args=("search",)).strip()
 
 selected_symbol = None
 if search_term:
@@ -630,14 +640,17 @@ if search_term:
             label = f"{nm} ({sym})" + (f" · {exch}" if exch else "")
             options[label] = sym
         if options:
-            choice = st.sidebar.selectbox("Select a match:", list(options.keys()))
+            choice = st.sidebar.selectbox("Select a match:", list(options.keys()),
+                                          key="match_select",
+                                          on_change=_set_mode, args=("search",))
             selected_symbol = options[choice]
     if selected_symbol is None:
         selected_symbol = search_term.upper()
         st.sidebar.caption(f"No stock matches — trying **{selected_symbol}** as a ticker.")
 
 st.sidebar.markdown("---")
-preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"])
+preset = st.sidebar.radio("Or browse movers:", ["Top Gainers", "Top Losers", "Most Active"],
+                          key="movers_radio", on_change=_set_mode, args=("movers",))
 preset_map = {"Top Gainers": "gainers", "Top Losers": "losers", "Most Active": "actives"}
 
 st.title("Stock Research Dashboard")
@@ -653,7 +666,10 @@ if not FMP_KEY:
     )
     st.stop()
 
-if selected_symbol:
+nav_mode = st.session_state.get("nav_mode", "movers")
+show_detail = (nav_mode == "search") and bool(selected_symbol)
+
+if show_detail:
     show_ticker(selected_symbol)
 else:
     show_movers(preset_map[preset])
