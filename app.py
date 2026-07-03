@@ -18,13 +18,14 @@ This app AGGREGATES and EXPLAINS. It never tells you to buy or sell.
 import streamlit as st
 import requests
 import pandas as pd
+import re
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layout="wide")
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.17.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3832,6 +3833,120 @@ def _render_research_read(name, F):
 # needs no API key. Verdict-free by construction.
 # ===========================================================================
 
+# ===========================================================================
+# STORAGE  —  persists small JSON docs (saved Context summaries, the watchlist)
+# to a private GitHub repo via the Contents API, since Streamlit Community
+# Cloud's own filesystem is ephemeral and st.cache_data is a shared cache, not
+# private storage. Uses GITHUB_TOKEN + GITHUB_DATA_REPO from secrets. Fails
+# soft everywhere: a missing/broken token disables saving without crashing
+# the rest of the app.
+# ===========================================================================
+
+import base64
+import json as _json
+import datetime as _dt
+
+_GH_API = "https://api.github.com"
+
+
+def _gh_configured():
+    return bool(st.secrets.get("GITHUB_TOKEN")) and bool(st.secrets.get("GITHUB_DATA_REPO"))
+
+
+def _gh_headers():
+    return {"Authorization": f"Bearer {st.secrets.get('GITHUB_TOKEN')}",
+            "Accept": "application/vnd.github+json"}
+
+
+def _gh_get_file(path):
+    """Returns (content_dict_or_None, sha_or_None). sha is required to update."""
+    if not _gh_configured():
+        return None, None
+    repo = st.secrets.get("GITHUB_DATA_REPO")
+    try:
+        r = requests.get(f"{_GH_API}/repos/{repo}/contents/{path}", headers=_gh_headers(), timeout=15)
+        if r.status_code == 404:
+            return None, None
+        r.raise_for_status()
+        d = r.json()
+        raw = base64.b64decode(d["content"]).decode("utf-8")
+        return _json.loads(raw), d.get("sha")
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _gh_put_file(path, data, sha=None, message="update"):
+    if not _gh_configured():
+        return False
+    repo = st.secrets.get("GITHUB_DATA_REPO")
+    body = {"message": message,
+            "content": base64.b64encode(_json.dumps(data, indent=2).encode("utf-8")).decode("ascii")}
+    if sha:
+        body["sha"] = sha
+    try:
+        r = requests.put(f"{_GH_API}/repos/{repo}/contents/{path}", headers=_gh_headers(),
+                         json=body, timeout=15)
+        return r.status_code in (200, 201)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ------------------------- saved research notes -------------------------
+
+def save_research_note(symbol, name, kind, payload):
+    """Appends one saved Context/summary for a symbol to notes/{SYMBOL}.json."""
+    path = f"notes/{symbol.upper()}.json"
+    existing, sha = _gh_get_file(path)
+    doc = existing or {"symbol": symbol.upper(), "name": name, "entries": []}
+    doc["entries"].insert(0, {
+        "kind": kind, "saved_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "data": payload,
+    })
+    doc["entries"] = doc["entries"][:20]   # keep it bounded
+    return _gh_put_file(path, doc, sha, message=f"Save {kind} note for {symbol.upper()}")
+
+
+def get_saved_notes(symbol):
+    doc, _ = _gh_get_file(f"notes/{symbol.upper()}.json")
+    return (doc or {}).get("entries", [])
+
+
+# ------------------------- tracker (watchlist) -------------------------
+
+TRACKER_PATH = "tracker/watchlist.json"
+TRACKER_MAX = 30
+
+
+def get_tracker():
+    doc, _ = _gh_get_file(TRACKER_PATH)
+    return (doc or {}).get("symbols", [])
+
+
+def add_to_tracker(symbol):
+    symbol = symbol.upper()
+    doc, sha = _gh_get_file(TRACKER_PATH)
+    doc = doc or {"symbols": []}
+    if symbol in doc["symbols"]:
+        return True, "Already tracked."
+    if len(doc["symbols"]) >= TRACKER_MAX:
+        return False, f"Tracker is full ({TRACKER_MAX} max) \u2014 remove one first."
+    doc["symbols"].append(symbol)
+    ok = _gh_put_file(TRACKER_PATH, doc, sha, message=f"Add {symbol} to tracker")
+    return ok, ("Added." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+
+
+def remove_from_tracker(symbol):
+    symbol = symbol.upper()
+    doc, sha = _gh_get_file(TRACKER_PATH)
+    doc = doc or {"symbols": []}
+    if symbol not in doc["symbols"]:
+        return True, "Not tracked."
+    doc["symbols"].remove(symbol)
+    ok = _gh_put_file(TRACKER_PATH, doc, sha, message=f"Remove {symbol} from tracker")
+    return ok, ("Removed." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+
+
+
+
 CONTEXT_DOMAINS = ["sec.gov", "businesswire.com", "globenewswire.com",
                    "prnewswire.com", "reuters.com", "apnews.com"]
 CONTEXT_DAILY_SOFT_LIMIT = 40   # per-session guard against runaway spend
@@ -3873,7 +3988,6 @@ def get_recent_filings(cik):
     dates = recent.get("filingDate") or []
     accs = recent.get("accessionNumber") or []
     docs = recent.get("primaryDocument") or []
-    descs = recent.get("primaryDocDescription") or []
     out, seen = [], set()
     for i, form in enumerate(forms):                 # arrays are newest-first
         if form in ("10-K", "10-Q", "8-K") and form not in seen:
@@ -3882,55 +3996,159 @@ def get_recent_filings(cik):
             url = (f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/{doc}"
                    if acc and doc else
                    f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_int}&type={form}")
-            out.append({"form": form, "date": dates[i] if i < len(dates) else "",
-                        "url": url, "desc": descs[i] if i < len(descs) else ""})
+            out.append({"form": form, "date": dates[i] if i < len(dates) else "", "url": url})
             seen.add(form)
         if len(seen) >= 3:
             break
     return out
 
 
+def _pct_or_dash(v):
+    return f"{v:+.1f}%" if v is not None else "n/a"
 
-def _build_context_prompt(symbol, name, filings):
-    filing_lines = "\n".join(f"- {f['form']} filed {f['date']}: {f['url']}" for f in filings) \
-        or "None retrieved."
-    return (
-        f"You are writing the \"Context\" section for a personal stock research dashboard. Use web "
-        f"search to identify recent, material developments for {symbol} ({name}). Cite sources. Do "
-        "NOT give buy/sell advice.\n\n"
-        f"Most recent SEC filings (summarize the newest 8-K / 10-Q / 10-K only if material):\n"
-        f"{filing_lines}\n\n"
-        "Priority order: (1) official company announcements / investor-relations, (2) SEC filings "
-        "(8-K, 10-Q, 10-K), (3) earnings releases & guidance, (4) reputable news, (5) sector/policy "
-        "news only if directly relevant.\n\n"
-        "Separate the PRIMARY catalyst (the single most important recent development) from any "
-        "SECONDARY one (e.g. a routine financing filing). Do not bundle unrelated events together.\n\n"
-        "Rate TWO kinds of materiality and TWO kinds of confidence \u2014 they are genuinely different:\n"
-        "- event_materiality: strategic importance to the business / investment thesis. A product or "
-        "platform announcement can be strategically High even if it changes no near-term numbers.\n"
-        "- financial_materiality: near-term impact on revenue, margins, guidance, or analyst "
-        "estimates. This is often Medium or Low for announcements until revenue actually shows up; "
-        "reserve High for guidance changes, large financings relative to the company's size, M&A, etc. "
-        "For a mega-cap, a routine debt offering is usually NOT high financial materiality.\n"
-        "- confidence_event_happened: how sure you are the event/filing is real (High if it comes "
-        "from a filing or official source).\n"
-        "- confidence_explains_move: how sure you are this explains any recent stock move. Default to "
-        "Medium \u2014 prices move for many reasons and other news often overlaps; only use High if a "
-        "source directly attributes the move to this event.\n\n"
-        "Return ONLY a JSON object, no markdown fences, exactly this shape:\n"
-        '{"what_changed":"1-2 sentence neutral summary",'
-        '"primary_catalyst":"the single most important development",'
-        '"secondary_catalyst":"a secondary development, or empty string",'
-        '"why_it_matters":"2-3 sentences, plain English, no verdict",'
-        '"investor_question":"the one thing that must be proven next",'
-        '"event_materiality":"High|Medium|Low","financial_materiality":"High|Medium|Low",'
-        '"confidence_event_happened":"High|Medium|Low","confidence_explains_move":"High|Medium|Low",'
-        '"warning":"any caveat, or empty string"}\n\n'
-        "Rules: say \"may explain\"/\"appears related to\", not \"caused\", unless a source says so. "
-        "Distinguish official filings/press releases from media commentary. If no clear catalyst, say "
-        "so in what_changed. If the move looks sector- or policy-driven, label it. Never say buy, "
-        "sell, or hold.")
 
+def get_context_dashboard_facts(symbol):
+    """Light numeric context handed to the model: recent returns, volume,
+    last EPS/revenue vs estimate, next earnings date. Best-effort; missing
+    pieces degrade to 'n/a' rather than failing the whole call."""
+    facts = {"r1": None, "r5": None, "r20": None, "vol_ratio": None,
+             "eps_actual": None, "eps_est": None, "rev_actual": None, "rev_est": None,
+             "next_earnings": None}
+    try:
+        df = get_price_history(symbol, start_days=40)
+        if not df.empty:
+            closes = pd.to_numeric(df["close"], errors="coerce").dropna().tolist()
+            def ret(n):
+                return ((closes[-1] / closes[-1 - n] - 1) * 100) if len(closes) > n else None
+            facts["r1"], facts["r5"], facts["r20"] = ret(1), ret(5), ret(20)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        facts["vol_ratio"] = to_float(get_technicals(symbol).get("vol_ratio"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ea = get_earnings_context(symbol)
+        last, nxt = ea.get("last") or {}, ea.get("next") or {}
+        facts["eps_actual"], facts["eps_est"] = last.get("eps_actual"), last.get("eps_est")
+        facts["rev_actual"], facts["rev_est"] = last.get("rev_actual"), last.get("rev_est")
+        facts["next_earnings"] = nxt.get("date")
+    except Exception:  # noqa: BLE001
+        pass
+    return facts
+
+
+def _build_context_prompt(symbol, name, filings, facts):
+    def fline(i):
+        if i < len(filings):
+            f = filings[i]
+            return f"- {f['form']} filed {f['date']}: {f['url']}"
+        return "- (none available)"
+
+    return f"""You are writing the "Context" section for a personal stock research dashboard.
+
+Ticker: {symbol}
+Company: {name}
+
+Use web search to identify recent, material developments for this company. Do NOT give buy/sell/hold advice.
+
+Most recent SEC filings to review if relevant:
+{fline(0)}
+{fline(1)}
+{fline(2)}
+
+Optional dashboard context:
+- 1D return: {_pct_or_dash(facts.get('r1'))}
+- 5D return: {_pct_or_dash(facts.get('r5'))}
+- 20D return: {_pct_or_dash(facts.get('r20'))}
+- Volume vs average: {num(facts.get('vol_ratio')) if facts.get('vol_ratio') is not None else 'n/a'}x
+- Last EPS actual vs estimate: {money(facts.get('eps_actual'))} vs {money(facts.get('eps_est'))}
+- Last revenue actual vs estimate: {big_money(facts.get('rev_actual'))} vs {big_money(facts.get('rev_est'))}
+- Next earnings date: {facts.get('next_earnings') or 'n/a'}
+
+Priority order for sources:
+1. Official company announcements / investor relations
+2. SEC filings: 8-K, 10-Q, 10-K
+3. Earnings releases and guidance
+4. Reputable financial news
+5. Sector or policy news only if directly relevant
+
+Task:
+Identify the most important recent development and explain why it may matter. Separate the PRIMARY catalyst from any SECONDARY catalyst. Do not bundle unrelated events together.
+
+Materiality definitions:
+- Strategic materiality = importance to the business or investment thesis.
+- Near-term financial materiality = likely impact on revenue, margins, guidance, cash flow, debt, capex, or analyst estimates.
+A product announcement can be strategically High but financially Medium or Low until it shows up in numbers.
+A routine debt offering for a very large company is usually not High near-term financial materiality unless it is unusually large or changes the balance-sheet story.
+
+Confidence definitions:
+- Event happened = confidence that the event or filing is real.
+- Explains recent move = confidence that this event explains any recent stock move. Default to Medium unless a source directly attributes the move to this event.
+
+Important formatting rules:
+- Return clean, display-ready Markdown only.
+- Do not return JSON.
+- Do not use markdown tables.
+- Do not use citation chips, footnotes, bracket citations, or inline citations.
+- Do not put source links in the body paragraphs.
+- Do not write a Sources section \u2014 sources are handled separately by the dashboard.
+- Use short paragraphs and bullets.
+- Do not repeat the same section twice.
+- Do not say "caused" unless a source explicitly says so. Use "may explain," "appears related to," or "could matter because."
+- If there is no clear catalyst, say so clearly.
+
+Return exactly this format:
+
+## WHAT CHANGED
+{{1\u20132 sentence neutral summary of the most important recent development.}}
+
+**Primary catalyst:** {{single most important recent development}}
+**Secondary catalyst:** {{secondary development, or "None identified."}}
+
+**Strategic materiality:** High | Medium | Low
+**Near-term financial materiality:** High | Medium | Low
+**Confidence event happened:** High | Medium | Low
+**Confidence this explains the recent move:** High | Medium | Low
+
+### Why it matters
+{{2\u20133 plain-English sentences. Explain why this matters without giving investment advice.}}
+
+### Investor question
+{{The single most important question the investor should verify next.}}
+
+### Caveat
+{{Any uncertainty, risk, or reason not to overinterpret the catalyst. If none, write "No major caveat beyond normal market uncertainty."}}
+"""
+
+
+def _resolve_redirect(url, timeout=6):
+    """Follow a grounding redirect once to get the real publisher domain.
+    Best-effort: on any failure, fall back to the original URL/domain."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=timeout)
+        final = r.url
+        if final and final != url:
+            return final
+    except Exception:  # noqa: BLE001
+        pass
+    return url
+
+
+def _resolve_citations(raw_cites):
+    """raw_cites: list of {'uri':..., 'title':...} (Gemini) or plain URL strings
+    (Perplexity). Returns [{'title':..., 'url':...}] with redirects resolved."""
+    out = []
+    for c in raw_cites or []:
+        if isinstance(c, dict):
+            uri, title = c.get("uri"), c.get("title")
+        else:
+            uri, title = c, None
+        if not uri:
+            continue
+        real = _resolve_redirect(uri) if "vertexaisearch" in uri else uri
+        out.append({"title": title or _short_url(real), "url": real})
+    return out
 
 
 def _context_via_perplexity(prompt):
@@ -3960,25 +4178,47 @@ def _context_via_gemini(prompt):
     r.raise_for_status()
     cand = (r.json().get("candidates") or [{}])[0]
     text = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []))
-    cites = [(c.get("web") or {}).get("uri")
-             for c in ((cand.get("groundingMetadata") or {}).get("groundingChunks") or [])
-             if (c.get("web") or {}).get("uri")]
+    chunks = ((cand.get("groundingMetadata") or {}).get("groundingChunks") or [])
+    cites = [{"uri": (c.get("web") or {}).get("uri"), "title": (c.get("web") or {}).get("title")}
+             for c in chunks if (c.get("web") or {}).get("uri")]
     return text, cites
 
 
-def _parse_context_json(text):
-    import json as _json
+_CTX_SECTION_RE = re.compile(
+    r"##\s*WHAT CHANGED\s*(?P<what_changed>.*?)"
+    r"\*\*Primary catalyst:\*\*\s*(?P<primary>.*?)\n"
+    r"\*\*Secondary catalyst:\*\*\s*(?P<secondary>.*?)\n"
+    r".*?\*\*Strategic materiality:\*\*\s*(?P<strat_mat>\w+)"
+    r".*?\*\*Near-term financial materiality:\*\*\s*(?P<fin_mat>\w+)"
+    r".*?\*\*Confidence event happened:\*\*\s*(?P<conf_event>\w+)"
+    r".*?\*\*Confidence this explains the recent move:\*\*\s*(?P<conf_move>\w+)"
+    r".*?###\s*Why it matters\s*(?P<why>.*?)"
+    r"###\s*Investor question\s*(?P<question>.*?)"
+    r"###\s*Caveat\s*(?P<caveat>.*)",
+    re.S | re.I)
+
+
+def _parse_context_markdown(text):
     t = (text or "").strip()
     if t.startswith("```"):
         t = t.strip("`")
-        t = t[4:] if t[:4].lower() == "json" else t
-    a, b = t.find("{"), t.rfind("}")
-    if a >= 0 and b > a:
-        try:
-            return _json.loads(t[a:b + 1])
-        except Exception:  # noqa: BLE001
-            pass
-    return {"latest_catalyst": (text or "")[:600].strip(), "_unparsed": True}
+        t = t[4:] if t[:4].lower() == "markdown" else t
+    m = _CTX_SECTION_RE.search(t)
+    if not m:
+        return {"_unparsed": True, "raw": t}
+    d = {k: (v or "").strip() for k, v in m.groupdict().items()}
+    return {
+        "what_changed": d["what_changed"],
+        "primary_catalyst": d["primary"],
+        "secondary_catalyst": (None if d["secondary"].lower().startswith("none") else d["secondary"]),
+        "strategic_materiality": d["strat_mat"].title(),
+        "financial_materiality": d["fin_mat"].title(),
+        "confidence_event": d["conf_event"].title(),
+        "confidence_move": d["conf_move"].title(),
+        "why_it_matters": d["why"],
+        "investor_question": d["question"],
+        "caveat": (None if d["caveat"].lower().startswith("no major caveat") else d["caveat"]),
+    }
 
 
 @st.cache_data(ttl=43200, show_spinner=False)   # cached per (symbol, provider, day)
@@ -3988,7 +4228,8 @@ def generate_context(symbol, name, provider, day):
         filings = get_recent_filings(get_earnings_context(symbol).get("cik"))
     except Exception:  # noqa: BLE001
         filings = []
-    prompt = _build_context_prompt(symbol, name, filings)
+    facts = get_context_dashboard_facts(symbol)
+    prompt = _build_context_prompt(symbol, name, filings, facts)
     try:
         if provider == "perplexity":
             text, cites = _context_via_perplexity(prompt)
@@ -3998,89 +4239,31 @@ def generate_context(symbol, name, provider, day):
             return {"error": "No context provider configured.", "filings": filings}
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)[:200], "filings": filings}
-    res = _parse_context_json(text)
-    res["citations"] = [c for c in (cites or []) if c][:8]
+    res = _parse_context_markdown(text)
+    res["citations"] = _resolve_citations(cites)[:8]
     res["filings"] = filings
     return res
 
 
-def _ctx_tone(level):
-    return {"high": "risk", "medium": "caution", "low": "neutral"}.get((level or "").lower(), "neutral")
+# ------------------------- rendering -------------------------
 
-
-
-def _ctx_level_style(v):
-    v = (v or "").lower()
-    if v == "high":
-        return f"color:{INK};font-weight:700"
-    if v == "medium":
-        return f"color:{INK};font-weight:600"
-    if v == "low":
-        return f"color:{MUTED};font-weight:600"
-    return f"color:{MUTED}"
-
-
-def _ctx_pair(label, a_lab, a_val, b_lab, b_val):
-    def chip(v):
-        return f"<span style='{_ctx_level_style(v)}'>{v or '\u2014'}</span>"
-    return (f"<div style='font-size:.86rem;color:{MUTED};margin:.2rem 0'>"
-            f"<b style='color:{INK};letter-spacing:.03em'>{label}</b> &nbsp; "
-            f"{a_lab}: {chip(a_val)} &nbsp;\u00b7&nbsp; {b_lab}: {chip(b_val)}</div>")
-
-
-def _render_context_card(res, symbol):
-    if res.get("error"):
-        st.warning(f"Couldn't fetch live context ({res['error']}). The copy-prompt route still works, "
-                   "and any filings found are linked below.")
+def _ctx_materiality_sentence(res):
+    """Two deterministic plain-English sentences instead of four chips."""
+    strat = (res.get("strategic_materiality") or "").lower()
+    fin = (res.get("financial_materiality") or "").lower()
+    ev = (res.get("confidence_event") or "").lower()
+    mv = (res.get("confidence_move") or "").lower()
+    if not (strat and fin and ev and mv):
+        return None
+    adv = {"high": "highly", "medium": "moderately", "low": "not very"}
+    s1 = (f"This looks like a {strat}-importance development strategically, with "
+          f"{fin} near-term financial impact.")
+    if ev == mv:
+        s2 = f"We're {adv.get(ev, ev)} confident both that it happened and that it explains the recent move."
     else:
-        wc = res.get("what_changed") or res.get("latest_catalyst") or \
-            "No clear recent catalyst was found."
-        html = (
-            f"<div style='border:1px solid {LINE};border-left:3px solid {INK};background:#F7F5EE;"
-            f"border-radius:10px;padding:.9rem 1.1rem;margin:.3rem 0 .5rem;max-width:52rem'>"
-            f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
-            f"margin-bottom:.35rem'>What changed</div>"
-            f"<div style='font-size:1.02rem;line-height:1.5;color:{INK};font-weight:600'>{wc}</div>")
-        if res.get("primary_catalyst"):
-            html += (f"<div style='font-size:.9rem;color:{INK};margin-top:.45rem'>"
-                     f"<b>Primary catalyst:</b> {res['primary_catalyst']}</div>")
-        if res.get("secondary_catalyst"):
-            html += (f"<div style='font-size:.88rem;color:{MUTED};margin-top:.15rem'>"
-                     f"<b>Secondary:</b> {res['secondary_catalyst']}</div>")
-        html += "</div>"
-        st.markdown(html, unsafe_allow_html=True)
-
-        st.markdown(
-            _ctx_pair("Materiality", "strategic", res.get("event_materiality"),
-                      "near-term financial", res.get("financial_materiality"))
-            + _ctx_pair("Confidence", "event happened", res.get("confidence_event_happened"),
-                        "explains the move", res.get("confidence_explains_move")),
-            unsafe_allow_html=True)
-
-        if res.get("why_it_matters"):
-            _guide_para("<b>Why it matters:</b> " + res["why_it_matters"])
-        iq = res.get("investor_question") or res.get("what_to_verify_next")
-        if iq:
-            st.markdown(
-                f"<div style='font-size:.92rem;line-height:1.6;color:{INK};margin:.2rem 0;"
-                f"max-width:52rem;border-left:2px solid {LINE};padding-left:.7rem'>"
-                f"<b>The question to resolve:</b> {iq}</div>", unsafe_allow_html=True)
-        if res.get("warning"):
-            st.caption("Note: " + res["warning"])
-
-    cites = res.get("citations") or []
-    if cites:
-        links = " \u00b7 ".join(f"<a href='{u}' target='_blank'>{_short_url(u)}</a>" for u in cites)
-        st.markdown(f"<div style='font-size:.8rem;color:{MUTED};margin:.3rem 0'>"
-                    f"<b>Sources:</b> {links}</div>", unsafe_allow_html=True)
-    filings = res.get("filings") or []
-    if filings:
-        fl = " \u00b7 ".join(f"<a href='{f['url']}' target='_blank'>{f['form']} ({f['date']})</a>"
-                             for f in filings)
-        st.markdown(f"<div style='font-size:.8rem;color:{MUTED};margin:.1rem 0 .3rem'>"
-                    f"<b>Latest filings:</b> {fl}</div>", unsafe_allow_html=True)
-    st.caption("Context is aggregated from cited sources \u2014 not a recommendation.")
-
+        s2 = (f"We're {adv.get(ev, ev)} confident it happened, but only "
+              f"{adv.get(mv, mv)} confident it explains any recent price move.")
+    return s1 + " " + s2
 
 
 def _short_url(u):
@@ -4090,22 +4273,104 @@ def _short_url(u):
         return "source"
 
 
+def _render_context_card(res, symbol, name):
+    if res.get("error"):
+        st.warning(f"Couldn't fetch live context ({res['error']}). The copy-prompt route still works, "
+                   "and any filings found are linked below.")
+        filings = res.get("filings") or []
+        if filings:
+            with st.expander("Sources and Filings"):
+                for f in filings:
+                    st.markdown(f"- [{f['form']} ({f['date']})]({f['url']})")
+        return
+
+    if res.get("_unparsed"):
+        st.caption("Context came back in an unexpected format \u2014 showing it as-is.")
+        st.markdown(res.get("raw", ""))
+        return
+
+    what = res.get("what_changed") or "No clear recent catalyst was found."
+    cat_lines = []
+    if res.get("primary_catalyst"):
+        cat_lines.append(f"1. {res['primary_catalyst']}")
+    if res.get("secondary_catalyst"):
+        cat_lines.append(f"2. {res['secondary_catalyst']}")
+    cat_html = "".join(f"<div style='font-size:.92rem;color:{INK};margin-top:.3rem'>{c}</div>"
+                       for c in cat_lines)
+
+    st.markdown(
+        f"<div style='border:1px solid {LINE};border-radius:10px;padding:.9rem 1.1rem;"
+        f"margin:.3rem 0 .5rem;max-width:52rem'>"
+        f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
+        f"margin-bottom:.4rem'>What changed</div>"
+        f"<div style='font-size:.98rem;line-height:1.55;color:{INK};font-style:italic'>{what}</div>"
+        f"{cat_html}</div>",
+        unsafe_allow_html=True)
+
+    sentence = _ctx_materiality_sentence(res)
+    if sentence:
+        st.markdown(f"<div style='font-size:.92rem;line-height:1.55;color:{INK};margin:.2rem 0 .5rem;"
+                    f"max-width:52rem'>{sentence}</div>", unsafe_allow_html=True)
+
+    if res.get("why_it_matters"):
+        st.markdown(f"<div style='font-size:.95rem;line-height:1.6;color:{INK};margin:.2rem 0;"
+                    f"max-width:52rem'><b>Why it matters:</b> {res['why_it_matters']}</div>",
+                    unsafe_allow_html=True)
+
+    iq = res.get("investor_question")
+    cav = res.get("caveat")
+    if iq or cav:
+        with st.expander("Worth checking before you decide", expanded=False):
+            if iq:
+                st.markdown(f"<div style='font-size:.85rem;color:{MUTED}'>{iq}</div>",
+                            unsafe_allow_html=True)
+            if cav:
+                st.markdown(f"<div style='font-size:.85rem;color:{MUTED};margin-top:.3rem'>"
+                            f"<i>Caveat:</i> {cav}</div>", unsafe_allow_html=True)
+
+    cites = res.get("citations") or []
+    filings = res.get("filings") or []
+    if cites or filings:
+        with st.expander("Sources and Filings", expanded=False):
+            for c in cites:
+                st.markdown(f"- [{c['title']}]({c['url']})")
+            for f in filings:
+                st.markdown(f"- {f['form']} ({f['date']}) \u2014 [SEC filing]({f['url']})")
+
+    st.caption("Context is aggregated from cited sources \u2014 not a recommendation.")
+
+    key = f"ctxsave_{symbol}_{name}"
+    if st.button("Save this summary", key=f"ctxsavebtn_{symbol}", use_container_width=False):
+        ok = save_research_note(symbol, name, "context", res)
+        st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+
+
 def _context_prompt_body(symbol, name):
     try:
         filings = get_recent_filings(get_earnings_context(symbol).get("cik"))
     except Exception:  # noqa: BLE001
         filings = []
+    facts = get_context_dashboard_facts(symbol)
     st.caption("Paste this into Perplexity, Gemini, ChatGPT, or Claude to get the cited briefing for "
-               "free \u2014 it already includes the latest SEC filing links.")
-    st.code(_build_context_prompt(symbol, name, filings), language="markdown")
+               "free \u2014 it already includes the latest SEC filing links and dashboard numbers.")
+    prompt_text = _build_context_prompt(symbol, name, filings, facts)
+    st.code(prompt_text, language="markdown")
+    st.caption("Ran this externally? Paste the result below to save it for later.")
+    pasted = st.text_area("Paste the AI's response here", key=f"ctxpaste_{symbol}", height=160)
+    if st.button("Save pasted response", key=f"ctxpastesave_{symbol}"):
+        if pasted.strip():
+            ok = save_research_note(symbol, name, "external", {"raw": pasted.strip()})
+            st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+        else:
+            st.warning("Paste something first.")
 
 
 if hasattr(st, "dialog"):
     try:
-        _context_prompt_dialog = st.dialog("Context prompt \u2014 paste into any AI",
+        _context_prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI",
                                            width="large")(_context_prompt_body)
     except TypeError:
-        _context_prompt_dialog = st.dialog("Context prompt")(_context_prompt_body)
+        _context_prompt_dialog = st.dialog("Research prompt")(_context_prompt_body)
 else:
     _context_prompt_dialog = _context_prompt_body
 
@@ -4125,20 +4390,31 @@ def render_context(symbol, name):
         st.caption("Add a `PERPLEXITY_API_KEY` or `GEMINI_API_KEY` in Streamlit secrets to enable the "
                    "in-app briefing \u2014 or use **Copy research prompt** (free, works in any AI).")
         return
-    if not gen:
+    cache_key = f"_ctx_cache_{symbol}"
+    if not gen and cache_key not in st.session_state:
         cap = ("console.perplexity.ai" if provider == "perplexity"
                else "your Google Cloud billing budget")
         st.caption(f"On demand, **{provider}** pulls recent news + the latest SEC filings with "
                    f"citations. Cached per stock per day; set a monthly spend cap in {cap}.")
         return
-    if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
-        st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
-                   "Reload to reset, or use the free copy-prompt route.")
-        return
-    st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
-    with st.spinner("Reading recent news and filings\u2026"):
-        res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
-    _render_context_card(res, symbol)
+    if gen:
+        if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
+            st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
+                       "Reload to reset, or use the free copy-prompt route.")
+            return
+        st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+        with st.spinner("Reading recent news and filings\u2026"):
+            res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
+        st.session_state[cache_key] = res
+    res = st.session_state.get(cache_key)
+    if res:
+        _render_context_card(res, symbol, name)
+
+
+def get_cached_context(symbol):
+    """For reuse elsewhere (e.g. Market tab): only returns context already
+    generated this session via Guide Me \u2014 never triggers a new API call."""
+    return st.session_state.get(f"_ctx_cache_{symbol}")
 
 
 
@@ -4675,6 +4951,17 @@ def show_ticker(symbol):
 
     # ---------------- MARKET: expectations, earnings, price setup ----------------
     with tab_market:
+        section("Context — recent news & filings", "what's pulled from web search & SEC")
+        _cached_ctx = get_cached_context(symbol)
+        if _cached_ctx:
+            _render_context_card(_cached_ctx, symbol, name)
+        else:
+            st.caption("No context generated yet this session. Generate it from **Guide Me → "
+                       "Step 1** and it will also appear here — no extra cost to view it twice.")
+            if st.button("Go generate it in Guide Me", key=f"ctx_jump_{symbol}"):
+                st.session_state["detail_mode"] = "Guide Me"
+                st.rerun()
+
         section("Analyst Expectations", "what the market already expects")
         render_analyst(symbol)
 
