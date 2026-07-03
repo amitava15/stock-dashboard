@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.21.0"
+APP_VERSION = "0.22.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3834,42 +3834,203 @@ def render_industry_benchmark(symbol):
 # ===========================================================================
 
 def _build_research_prompt(symbol):
-    company = symbol.upper()
-    raw = _analysis_json(symbol)
-    return (
-        f"You are helping me research {company} for my own investment decision. Below is a JSON "
-        "snapshot of the company's current data, pulled from my research dashboard.\n\n"
-        "Write a detailed, plain-English research report a thoughtful beginner could follow. Walk "
-        "these areas in order: (1) what recently changed, (2) business quality, (3) cash "
-        "generation, (4) valuation, (5) what the market already expects, (6) risk & timing. For "
-        "EACH area:\n"
-        "  a. State the facts from the data.\n"
-        "  b. Explain what that pattern usually means \u2014 give BOTH the bullish and the bearish "
-        "reading.\n"
-        "  c. Say what I should verify next, and why it matters.\n\n"
-        "Then give a clear Bull Case and Bear Case, and finish with the 3\u20135 open questions that "
-        "would settle the debate between them.\n\n"
-        "Do NOT tell me to buy, sell, or hold. Explain the numbers so I can decide for myself. Point "
-        "out anything in the data that looks extreme, cyclical, or internally inconsistent so I don't "
-        "take it at face value.\n\n"
-        f"DATA (JSON):\n{raw}\n"
-    )
+    sym = symbol.upper()
+    raw = _analysis_json(sym)
+    try:
+        filings = get_recent_filings(get_earnings_context(sym).get("cik"))
+    except Exception:  # noqa: BLE001
+        filings = []
+
+    def f_type(i):
+        return filings[i]["form"] if i < len(filings) else "(none available)"
+
+    def f_date(i):
+        return filings[i]["date"] if i < len(filings) else ""
+
+    def f_url(i):
+        return filings[i]["url"] if i < len(filings) else ""
+
+    return f"""You are helping me research {sym} for my own investment decision. Below is a JSON snapshot of the company's current data, pulled from my research dashboard.
+
+Also use web search to review recent company-specific context, including official announcements, latest SEC filings, earnings releases, guidance, and reputable financial news. Use that outside context to explain what recently changed and how it affects the interpretation of the dashboard numbers.
+
+Do NOT tell me to buy, sell, or hold. Explain the numbers so I can decide for myself.
+
+The purpose of this report is to answer:
+"What changed recently, what do the numbers say, what does the market already expect, and what should I verify next?"
+
+Most recent SEC filings to review if relevant:
+- {f_type(0)} filed {f_date(0)}: {f_url(0)}
+- {f_type(1)} filed {f_date(1)}: {f_url(1)}
+- {f_type(2)} filed {f_date(2)}: {f_url(2)}
+
+Source priority:
+1. Official company investor-relations announcements
+2. SEC filings: 8-K, 10-Q, 10-K
+3. Earnings releases and guidance
+4. Reputable financial news such as Reuters, AP, Bloomberg, CNBC, WSJ, Barron's, MarketWatch, Financial Times, or Investor's Business Daily
+5. Sector or policy news only if directly relevant
+
+Do not use low-quality blogs, broker marketing pages, promotional articles, SEO pages, anonymous posts, crypto/exchange sites, thin market-commentary pages, or generic stock-analysis summaries for material claims. If such a source appears in search results, ignore it unless it is only being used as non-material background.
+
+Before writing the report, identify:
+- The single most important recent company-specific development.
+- Any secondary development, if relevant.
+- Whether each development is official company information, an SEC filing, earnings/guidance, reputable news, or sector context.
+- Whether the development is already visible in the dashboard numbers.
+- Whether it affects revenue, margins, guidance, cash flow, capex, debt, analyst estimates, valuation, or risk.
+- Whether it plausibly explains recent price movement. Do not say "caused" unless a reliable source explicitly says so. Use "may explain," "appears related to," or "the connection is unclear."
+
+Evidence rules:
+- Use official company releases and SEC filings for company-reported numbers whenever available.
+- Use reputable financial news only to explain market reaction, analyst expectations, or context not available in official sources.
+- Every material claim from web search must be supported by a source listed in "Sources Reviewed."
+- Do not put inline links, citation chips, footnotes, or bracket citations inside the main report body.
+- Put source links only in the final "Sources Reviewed" section.
+- If dashboard data and web context appear inconsistent, flag the inconsistency instead of forcing a conclusion.
+- If a dashboard field is blank, N/A, unavailable, or unknown, do not mention it unless the absence itself is important.
+
+Financial interpretation rules:
+- If the company is loss-making, do not interpret negative P/E as cheap. Say P/E is not meaningful.
+- If free cash flow yield is negative, describe it as cash burn, even if free cash flow improved year over year.
+- If EPS actual and EPS estimate are both negative, remember that a smaller loss than expected is an earnings beat.
+- Do not say a company beat expectations on "net income" unless a source specifically compares net income to consensus. Usually, consensus comparisons should be described as EPS and revenue.
+- Do not call growth "exponential" unless the source explicitly uses that word and the math supports it.
+- Avoid promotional phrases such as "unparalleled," "massive," "dramatic," "stronger than ever," "severe shortage," "dominant," "guaranteed," or "decouple." Prefer neutral language such as "strong," "record," "above expectations," "may improve visibility," "could reduce some cyclicality," or "needs to be proven over future quarters."
+
+Write a detailed, plain-English research report a thoughtful beginner could follow.
+
+Walk these areas in order:
+
+1. What recently changed
+2. Business quality
+3. Cash generation
+4. Valuation
+5. What the market already expects
+6. Risk & timing
+
+For EACH area:
+a. State the facts from the dashboard data.
+b. Add relevant context from recent filings, earnings releases, official announcements, or reputable news.
+c. Explain what that pattern usually means.
+d. Give BOTH the bullish and the bearish reading.
+e. Say what I should verify next, and why it matters.
+
+Specific section instructions:
+
+1. What recently changed
+- Start with the most important recent filing, earnings release, guidance update, official announcement, or reputable news catalyst.
+- Clearly separate the primary catalyst from any secondary catalyst.
+- Explain whether the recent price movement appears connected to the catalyst or whether the connection is unclear.
+- Do not bundle unrelated developments together.
+
+2. Business quality
+- Use the dashboard's revenue, EPS, margin, ROE, and recent-quarter data.
+- Tie in filings/news to explain whether recent developments confirm or challenge the business trend.
+- If the news is strategically important but not yet visible in revenue, margins, or estimates, say that clearly.
+
+3. Cash generation
+- Use free cash flow, FCF margin, FCF yield, operating cash flow, capex, cash, debt, and recent-quarter FCF where available.
+- If EPS is strong but FCF is weak, explain the tension clearly.
+- Use filings/news to explain whether cash weakness is likely due to investment, capex, working capital, AI/cloud infrastructure, debt, or another factor.
+
+4. Valuation
+- Use P/E, forward P/E, PEG, EV/EBITDA, price/sales, FCF yield, and comparison to 5-year median.
+- Explain whether recent developments make the valuation easier or harder to justify.
+- Do not call the stock cheap only because it trades below historical multiples. Explain what must happen for the current valuation to make sense.
+
+5. What the market already expects
+- Use analyst ratings, price targets, implied upside/downside, forward estimates, next earnings date, and estimate direction if available.
+- Use recent news only if it helps explain expectations.
+- Focus on whether the bar is low, reasonable, or high.
+
+6. Risk & timing
+- Use 1D/5D/20D price movement, RSI, moving averages, beta, volume vs average, distance from 52-week high/low, and upcoming earnings date.
+- Tie recent price action to filings/news only if there is a clear connection.
+- Say whether the timing looks calm, stretched, event-driven, or uncertain.
+
+Then give:
+- A clear Bull Case.
+- A clear Bear Case.
+- The 3\u20135 open questions that would settle the debate between them.
+
+Point out anything in the data that looks extreme, cyclical, temporary, or internally inconsistent so I do not take it at face value.
+
+Formatting rules:
+- Return clean, display-ready Markdown.
+- Use clear headings.
+- Use short paragraphs and bullets where helpful.
+- Do not use markdown tables.
+- Do not include inline source links in the report body.
+- Do not give investment advice.
+- Do not use buy/sell/hold language.
+- Keep the tone neutral, analytical, and beginner-friendly.
+
+At the end, include these two sections:
+
+## What Recent Filings and News Changed
+
+Summarize the 1\u20133 most important recent developments and explain how they affected the interpretation of the dashboard data. Keep this factual and concise.
+
+## Sources Reviewed
+
+- [Source title](URL) \u2014 Publisher, date
+- [Source title](URL) \u2014 Publisher, date
+- [Source title](URL) \u2014 Publisher, date
+
+DATA (JSON):
+{raw}
+"""
 
 
-def _prompt_dialog(symbol):
-    st.caption("Copy this into Claude.ai, ChatGPT, or any AI chat to get a full written report with "
-               "**no API cost**. It already contains every number from this page.")
-    st.code(_build_research_prompt(symbol), language="markdown")
-    st.caption("Use the copy button at the top-right of the box, then paste it into your AI of choice.")
+def _research_prompt_body(symbol):
+    sym = symbol.upper()
+    name = (get_company_profile(sym).get("name") or sym)
+
+    paste_key = f"reportpaste_{sym}"
+    clear_flag = f"_reportpaste_clear_{sym}"
+    if st.session_state.pop(clear_flag, False):
+        st.session_state[paste_key] = ""
+
+    existing = get_research_report(sym)
+    if existing and existing.get("raw"):
+        when = (existing.get("saved_at") or "")[:16].replace("T", " ")
+        st.caption(f"Currently saved: pulled **{when}**. Saving again below will "
+                   "**overwrite** this \u2014 there's only one saved report per stock.")
+        with st.expander("View currently saved report", expanded=False):
+            st.markdown(existing["raw"])
+
+    st.caption("Already ran this externally? Paste the AI's response here and save it \u2014 "
+               "this replaces whatever was saved before, and is stamped with today's date.")
+    pasted = st.text_area("Paste the AI's response here", key=paste_key, height=160)
+    if st.button("Save (overwrites previous)", key=f"reportsave_{sym}"):
+        if pasted.strip():
+            with st.spinner("Saving\u2026"):
+                ok, msg = save_research_report(sym, name, pasted.strip())
+            if ok:
+                st.session_state[clear_flag] = True
+                _toast(msg, ok=True)
+                st.rerun()
+            else:
+                _toast(msg, ok=False)
+        else:
+            st.warning("Paste something first.")
+
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.7rem 0'>",
+                unsafe_allow_html=True)
+    st.caption("Or copy this prompt into Perplexity, Gemini, ChatGPT, or Claude \u2014 it uses web "
+               "search plus every number on this page, and produces a full written report with "
+               "**no API cost** to this app.")
+    st.code(_build_research_prompt(sym), language="markdown")
 
 
-# Present as a modal where Streamlit supports it; otherwise it renders inline (still works).
 if hasattr(st, "dialog"):
     try:
-        _prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI", width="large")(_prompt_dialog)
+        _prompt_dialog = st.dialog("Research Prompt", width="large")(_research_prompt_body)
     except TypeError:
-        _prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI")(_prompt_dialog)
-
+        _prompt_dialog = st.dialog("Research Prompt")(_research_prompt_body)
+else:
+    _prompt_dialog = _research_prompt_body
 
 def _guide_para(text):
     st.markdown(
@@ -4239,6 +4400,35 @@ def save_research_note(symbol, name, kind, payload):
 def get_saved_notes(symbol):
     doc, _ = _gh_get_file(f"notes/{symbol.upper()}.json")
     return (doc or {}).get("entries", [])
+
+
+# ------------------------- saved research report (single slot, overwrites) -------------------------
+# Distinct from the notes above: this holds ONE report per symbol, always
+# overwritten by the next save, with a clear "pulled on" date \u2014 for the
+# full comprehensive Research Prompt, not the running history of short
+# Context summaries.
+
+REPORT_MAX_CHARS = 60000   # a full multi-section report legitimately runs long;
+                           # this still catches a wildly-wrong mispaste (e.g. a source file)
+
+
+def save_research_report(symbol, name, raw_text):
+    size = len(raw_text)
+    if size > REPORT_MAX_CHARS:
+        return False, (f"That's too large to be a research report ({size:,} characters, limit "
+                       f"{REPORT_MAX_CHARS:,}) \u2014 looks like something other than a research "
+                       "report got pasted in. Nothing was saved.")
+    path = f"notes/{symbol.upper()}_report.json"
+    _existing, sha = _gh_get_file(path)
+    doc = {"symbol": symbol.upper(), "name": name,
+          "saved_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "raw": raw_text}
+    ok = _gh_put_file(path, doc, sha, message=f"Save research report for {symbol.upper()}")
+    return ok, ("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+
+
+def get_research_report(symbol):
+    doc, _ = _gh_get_file(f"notes/{symbol.upper()}_report.json")
+    return doc
 
 
 # ------------------------- tracker (watchlist) -------------------------
@@ -5054,18 +5244,10 @@ def render_guided(symbol, quote, profile, metrics):
     sym = symbol.upper()
     name = profile.get("name") or sym
 
-    # ---- top controls: AI toggle + free copy-prompt ----
-    cc = st.columns([1.5, 1.7, 2.8])
-    with cc[0]:
-        ai_on = st.checkbox("AI-powered", key=f"guide_ai_{sym}",
-                            help="Let Claude write the analysis instead of the built-in guide. "
-                                 "Uses your Anthropic API key (a few cents per run).")
-    with cc[1]:
-        if st.button("Research prompt", key=f"guide_prompt_{sym}",
-                     use_container_width=True,
-                     help="Copy a ready-made prompt containing all the numbers, to paste into any "
-                          "AI chat \u2014 no API cost."):
-            _prompt_dialog(sym)
+    # ---- AI toggle ----
+    ai_on = st.checkbox("AI-powered", key=f"guide_ai_{sym}",
+                        help="Let Claude write the analysis instead of the built-in guide. "
+                             "Uses your Anthropic API key (a few cents per run).")
 
     if ai_on:
         st.caption("AI mode: Claude reads every number and writes the report. It gives a research "
@@ -5544,8 +5726,15 @@ def show_ticker(symbol):
         _ok, _text = _tmsg
         _toast(_text, _ok)
 
-    mode = st.radio("View mode", ["Guide Me", "Metrics"],
-                    horizontal=True, key="detail_mode", label_visibility="collapsed")
+    tcol1, tcol2 = st.columns([2.3, 1.3])
+    with tcol1:
+        mode = st.radio("View mode", ["Guide Me", "Metrics"],
+                        horizontal=True, key="detail_mode", label_visibility="collapsed")
+    with tcol2:
+        if st.button("Research Prompt", key=f"top_prompt_{symbol}", use_container_width=True,
+                     help="A full research-report prompt \u2014 web search + SEC filings + every "
+                          "number on this page. Paste into any AI, and save the result here."):
+            _prompt_dialog(symbol)
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.1rem 0 .6rem'>",
                 unsafe_allow_html=True)
     if mode == "Guide Me":
