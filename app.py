@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.17.0"
+APP_VERSION = "0.18.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -4008,12 +4008,27 @@ def _pct_or_dash(v):
 
 
 def get_context_dashboard_facts(symbol):
-    """Light numeric context handed to the model: recent returns, volume,
-    last EPS/revenue vs estimate, next earnings date. Best-effort; missing
-    pieces degrade to 'n/a' rather than failing the whole call."""
-    facts = {"r1": None, "r5": None, "r20": None, "vol_ratio": None,
-             "eps_actual": None, "eps_est": None, "rev_actual": None, "rev_est": None,
-             "next_earnings": None}
+    """Numeric context handed to the model: price/return/volume, earnings,
+    business & valuation metrics, analyst expectations. Best-effort — any
+    piece we don't reliably have (e.g. opex/capex/net debt aren't tracked
+    anywhere in the app yet) degrades to None -> 'n/a' rather than being
+    guessed at, and the prompt is instructed to omit blank fields cleanly."""
+    facts = {k: None for k in [
+        "price", "market_cap", "r1", "r5", "r20", "dist_high", "vol_ratio", "trend_label",
+        "last_earnings_date", "eps_actual", "eps_est", "rev_actual", "rev_est", "next_earnings",
+        "next_q_rev_guidance", "next_q_eps_guidance",
+        "revenue_growth_yoy", "gross_margin", "op_margin", "net_margin", "fcf_yield",
+        "operating_cash_flow", "capex", "cash", "total_debt", "net_debt",
+        "pe_ttm", "forward_pe", "price_to_sales", "ev_ebitda",
+        "fy1_rev_est", "fy1_eps_est", "fy2_rev_est", "fy2_eps_est",
+        "analyst_consensus", "avg_price_target", "implied_upside",
+    ]}
+    try:
+        q = get_quote(symbol)
+        facts["price"] = to_float(q.get("price"))
+        facts["market_cap"] = to_float(q.get("market_cap"))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         df = get_price_history(symbol, start_days=40)
         if not df.empty:
@@ -4024,18 +4039,78 @@ def get_context_dashboard_facts(symbol):
     except Exception:  # noqa: BLE001
         pass
     try:
-        facts["vol_ratio"] = to_float(get_technicals(symbol).get("vol_ratio"))
+        t = get_technicals(symbol)
+        facts["dist_high"] = to_float(t.get("dist_high"))
+        facts["vol_ratio"] = to_float(t.get("vol_ratio"))
+        bits = []
+        if t.get("above_50") is not None:
+            bits.append("above" if t["above_50"] else "below" + " 50-day avg")
+        if t.get("above_200") is not None:
+            bits.append(("above" if t["above_200"] else "below") + " 200-day avg")
+        if t.get("rsi") is not None:
+            bits.append(f"RSI {t['rsi']:.0f}")
+        facts["trend_label"] = ", ".join(bits) or None
     except Exception:  # noqa: BLE001
         pass
     try:
         ea = get_earnings_context(symbol)
         last, nxt = ea.get("last") or {}, ea.get("next") or {}
+        facts["last_earnings_date"] = last.get("date")
         facts["eps_actual"], facts["eps_est"] = last.get("eps_actual"), last.get("eps_est")
         facts["rev_actual"], facts["rev_est"] = last.get("rev_actual"), last.get("rev_est")
         facts["next_earnings"] = nxt.get("date")
     except Exception:  # noqa: BLE001
         pass
+    try:
+        km = get_key_metrics(symbol)
+        facts["gross_margin"] = to_float(km.get("gross_margin_pct"))
+        facts["net_margin"] = to_float(km.get("net_margin_pct"))
+        facts["pe_ttm"] = to_float(km.get("pe"))
+        facts["ev_ebitda"] = to_float(km.get("ev_ebitda"))
+        facts["total_debt"] = None  # scalar total debt isn't tracked as a single TTM figure yet
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        val = get_valuation_growth(symbol)
+        cur, gro = val.get("current") or {}, val.get("growth") or {}
+        facts["revenue_growth_yoy"] = to_float(gro.get("revenue"))
+        facts["fcf_yield"] = to_float(cur.get("fcf_yield"))
+        facts["forward_pe"] = to_float(cur.get("forward_pe"))
+        facts["price_to_sales"] = to_float(cur.get("ps"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        fe = get_forward_estimates(symbol, n=2)
+        years = fe.get("years") or []
+        if len(years) > 0:
+            facts["fy1_rev_est"], facts["fy1_eps_est"] = years[0].get("revenue"), years[0].get("eps")
+        if len(years) > 1:
+            facts["fy2_rev_est"], facts["fy2_eps_est"] = years[1].get("revenue"), years[1].get("eps")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        an = get_analyst(symbol)
+        tgt = an.get("target") or {}
+        facts["analyst_consensus"] = an.get("consensus")
+        facts["avg_price_target"] = to_float(tgt.get("avg"))
+        facts["implied_upside"] = to_float(tgt.get("upside"))
+    except Exception:  # noqa: BLE001
+        pass
     return facts
+
+
+def _fnum(v, kind="num"):
+    """Format a fact for the prompt, or 'n/a' if missing — lets the model's
+    own 'omit blank fields' instruction do the rest."""
+    if v is None:
+        return "n/a"
+    if kind == "money":
+        return money(v)
+    if kind == "big_money":
+        return big_money(v)
+    if kind == "pct":
+        return pct(v)
+    return num(v)
 
 
 def _build_context_prompt(symbol, name, filings, facts):
@@ -4045,65 +4120,156 @@ def _build_context_prompt(symbol, name, filings, facts):
             return f"- {f['form']} filed {f['date']}: {f['url']}"
         return "- (none available)"
 
+    run_date = _dt.date.today().isoformat()
+    f = facts
     return f"""You are writing the "Context" section for a personal stock research dashboard.
 
 Ticker: {symbol}
 Company: {name}
+Run date: {run_date}
 
 Use web search to identify recent, material developments for this company. Do NOT give buy/sell/hold advice.
+
+The purpose of this section is to answer:
+"What changed recently, why might it matter, and what should the investor verify next?"
+
+Look primarily for developments from the last 30\u201360 days unless an older filing is clearly still the most relevant context.
 
 Most recent SEC filings to review if relevant:
 {fline(0)}
 {fline(1)}
 {fline(2)}
 
-Optional dashboard context:
-- 1D return: {_pct_or_dash(facts.get('r1'))}
-- 5D return: {_pct_or_dash(facts.get('r5'))}
-- 20D return: {_pct_or_dash(facts.get('r20'))}
-- Volume vs average: {num(facts.get('vol_ratio')) if facts.get('vol_ratio') is not None else 'n/a'}x
-- Last EPS actual vs estimate: {money(facts.get('eps_actual'))} vs {money(facts.get('eps_est'))}
-- Last revenue actual vs estimate: {big_money(facts.get('rev_actual'))} vs {big_money(facts.get('rev_est'))}
-- Next earnings date: {facts.get('next_earnings') or 'n/a'}
+Dashboard context:
+- Current price: {_fnum(f.get('price'), 'money')}
+- Market cap: {_fnum(f.get('market_cap'), 'big_money')}
+- 1D return: {_fnum(f.get('r1'), 'pct')}
+- 5D return: {_fnum(f.get('r5'), 'pct')}
+- 20D return: {_fnum(f.get('r20'), 'pct')}
+- From 52-week high: {_fnum(f.get('dist_high'), 'pct')}
+- Volume vs average: {_fnum(f.get('vol_ratio'))}x
+- Trend label: {f.get('trend_label') or 'n/a'}
 
-Priority order for sources:
-1. Official company announcements / investor relations
+Latest earnings:
+- Last earnings report date: {f.get('last_earnings_date') or 'n/a'}
+- Last EPS actual vs estimate: {_fnum(f.get('eps_actual'), 'money')} vs {_fnum(f.get('eps_est'), 'money')}
+- Last revenue actual vs estimate: {_fnum(f.get('rev_actual'), 'big_money')} vs {_fnum(f.get('rev_est'), 'big_money')}
+- Next earnings date: {f.get('next_earnings') or 'n/a'}
+- Next-quarter revenue guidance: {f.get('next_q_rev_guidance') or 'n/a'}
+- Next-quarter EPS guidance: {f.get('next_q_eps_guidance') or 'n/a'}
+
+Business / financial context:
+- Revenue growth YoY: {_fnum(f.get('revenue_growth_yoy'), 'pct')}
+- Gross margin: {_fnum(f.get('gross_margin'), 'pct')}
+- Operating margin: {_fnum(f.get('op_margin'), 'pct')}
+- Net margin: {_fnum(f.get('net_margin'), 'pct')}
+- Free cash flow yield: {_fnum(f.get('fcf_yield'), 'pct')}
+- Operating cash flow: {_fnum(f.get('operating_cash_flow'), 'big_money')}
+- Capital expenditure: {_fnum(f.get('capex'), 'big_money')}
+- Cash and equivalents: {_fnum(f.get('cash'), 'big_money')}
+- Total debt: {_fnum(f.get('total_debt'), 'big_money')}
+- Net debt: {_fnum(f.get('net_debt'), 'big_money')}
+
+Valuation / expectations:
+- P/E TTM: {_fnum(f.get('pe_ttm'))}
+- Forward P/E: {_fnum(f.get('forward_pe'))}
+- Price/sales: {_fnum(f.get('price_to_sales'))}
+- EV/EBITDA: {_fnum(f.get('ev_ebitda'))}
+- FY1 revenue estimate: {_fnum(f.get('fy1_rev_est'), 'big_money')}
+- FY1 EPS estimate: {_fnum(f.get('fy1_eps_est'), 'money')}
+- FY2 revenue estimate: {_fnum(f.get('fy2_rev_est'), 'big_money')}
+- FY2 EPS estimate: {_fnum(f.get('fy2_eps_est'), 'money')}
+- Analyst consensus: {f.get('analyst_consensus') or 'n/a'}
+- Average price target: {_fnum(f.get('avg_price_target'), 'money')}
+- Implied upside/downside: {_fnum(f.get('implied_upside'), 'pct')}
+
+Source priority:
+1. Official company investor-relations announcements
 2. SEC filings: 8-K, 10-Q, 10-K
 3. Earnings releases and guidance
-4. Reputable financial news
+4. Reputable financial news such as Reuters, AP, Bloomberg, CNBC, WSJ, Barron's, MarketWatch, Financial Times, or Investor's Business Daily
 5. Sector or policy news only if directly relevant
 
+Do not use low-quality blogs, broker marketing pages, promotional articles, SEO pages, anonymous posts, crypto/exchange sites, thin market-commentary pages, or generic stock-analysis summaries for material claims. If such a source appears in search results, ignore it unless it is only being used as non-material background.
+
 Task:
-Identify the most important recent development and explain why it may matter. Separate the PRIMARY catalyst from any SECONDARY catalyst. Do not bundle unrelated events together.
+Identify the single most important recent development and explain why it may matter.
+
+Separate the PRIMARY catalyst from any SECONDARY catalyst. Do not bundle unrelated events together. There should be only one primary catalyst.
+
+Use the dashboard context to judge whether the catalyst is already visible in fundamentals, estimates, guidance, or price action.
+
+If recent price movement is negative despite strong company news, do not invent a negative company catalyst. Say the pullback may reflect valuation pressure, profit-taking, sector volatility, or uncertainty unless a reliable source directly identifies a company-specific reason.
+
+Evidence and source-quality rules:
+- Use official company investor-relations releases and SEC filings for all company-reported numbers whenever available.
+- Use reputable financial news only to explain market reaction, analyst consensus, or context not available in official filings.
+- Every number in PORTAL_TEXT must be directly supported by a reliable source or by the provided dashboard context.
+- Do not say the company beat expectations on "net income" unless a source specifically compares net income to consensus. Usually, consensus comparisons should be described as EPS and revenue.
+- Do not describe a customer agreement, lawsuit, financing, product launch, or partnership as material unless the source is official, an SEC filing, or a reputable financial news source.
+- Do not mention lawsuits, regulatory issues, competitor listings, rumors, or market chatter unless supported by a reputable source and clearly relevant to the recent move.
 
 Materiality definitions:
 - Strategic materiality = importance to the business or investment thesis.
-- Near-term financial materiality = likely impact on revenue, margins, guidance, cash flow, debt, capex, or analyst estimates.
-A product announcement can be strategically High but financially Medium or Low until it shows up in numbers.
-A routine debt offering for a very large company is usually not High near-term financial materiality unless it is unusually large or changes the balance-sheet story.
+- Near-term financial materiality = likely near-term impact on revenue, margins, guidance, cash flow, debt, capex, or analyst estimates.
+- A product announcement can be strategically High but financially Medium or Low until it shows up in numbers.
+- A long-term customer agreement can be strategically High, but near-term financial materiality should be Medium unless it changes current-quarter guidance, revenue, margins, cash flow, or analyst estimates.
+- A routine debt offering for a large company is usually not High near-term financial materiality unless unusually large or balance-sheet-changing.
 
 Confidence definitions:
 - Event happened = confidence that the event or filing is real.
-- Explains recent move = confidence that this event explains any recent stock move. Default to Medium unless a source directly attributes the move to this event.
+- Explains recent move = confidence that this event explains any recent stock move.
+- Default "confidence this explains the recent move" to Medium.
+- Use High only if a reliable source directly connects the event to the price move and the direction of the price move is consistent with the event.
+- Use Low if there is no clear link between the event and price movement.
+
+Financial interpretation rules:
+- If the company is loss-making, do not interpret negative P/E as cheap. Say P/E is not meaningful.
+- If free cash flow yield is negative, describe it as cash burn, even if free cash flow improved year over year.
+- If EPS actual and EPS estimate are both negative, remember that a smaller loss than expected is an earnings beat.
+- Do not call growth "exponential" unless the source explicitly uses that word and the math supports it.
+- Do not say long-term agreements eliminate cyclicality. Say they "may improve visibility" or "could reduce some cyclicality," and note that this still needs to be proven over future quarters.
+
+Tone rules:
+- Keep the tone neutral and research-oriented.
+- Avoid promotional or exaggerated language.
+- Do not use words or phrases such as "exponential," "unparalleled," "massive," "dramatic," "stronger than ever," "severe shortage," "structurally lower cyclicality," "guaranteed," "dominant," "historic," or "decouple" unless directly quoted from an official source.
+- Prefer neutral alternatives such as "strong," "record," "above expectations," "may improve visibility," "could reduce some cyclicality," or "needs to be proven over future quarters."
 
 Important formatting rules:
 - Return clean, display-ready Markdown only.
 - Do not return JSON.
 - Do not use markdown tables.
 - Do not use citation chips, footnotes, bracket citations, or inline citations.
-- Do not put source links in the body paragraphs.
-- Do not write a Sources section \u2014 sources are handled separately by the dashboard.
-- Use short paragraphs and bullets.
+- Do not put source links or source names anywhere in your answer \u2014 sources are tracked separately by the dashboard, not by you.
 - Do not repeat the same section twice.
-- Do not say "caused" unless a source explicitly says so. Use "may explain," "appears related to," or "could matter because."
+- Use short paragraphs and bullets.
+- Keep the text under 300 words.
+- Do not say "caused" unless a reliable source explicitly says so. Use "may explain," "appears related to," or "could matter because."
 - If there is no clear catalyst, say so clearly.
+- If a dashboard field above is "n/a", do not mention it unless the absence itself is important.
+- Do not give investment advice or a buy/sell/hold recommendation.
 
-Return exactly this format:
+Before writing the final answer, silently verify:
+1. The primary catalyst is supported by an official company source, SEC filing, earnings release, or reputable news source.
+2. All numbers are supported by real sources or the provided dashboard context.
+3. Weak sources are excluded from material claims.
+4. Materiality and confidence are not inflated.
+5. The wording is neutral rather than promotional.
+6. The text contains no links, no citations, and no source names.
+7. The text is under 300 words.
+8. The answer is not investment advice.
+
+Return exactly the following, and nothing else \u2014 no source list, no filing list, no preamble or closing remarks:
+
+PORTAL_TEXT_START
 
 ## WHAT CHANGED
+
 {{1\u20132 sentence neutral summary of the most important recent development.}}
 
-**Primary catalyst:** {{single most important recent development}}
+**Primary catalyst:** {{single most important recent development.}}
+
 **Secondary catalyst:** {{secondary development, or "None identified."}}
 
 **Strategic materiality:** High | Medium | Low
@@ -4112,14 +4278,20 @@ Return exactly this format:
 **Confidence this explains the recent move:** High | Medium | Low
 
 ### Why it matters
+
 {{2\u20133 plain-English sentences. Explain why this matters without giving investment advice.}}
 
 ### Investor question
+
 {{The single most important question the investor should verify next.}}
 
 ### Caveat
+
 {{Any uncertainty, risk, or reason not to overinterpret the catalyst. If none, write "No major caveat beyond normal market uncertainty."}}
+
+PORTAL_TEXT_END
 """
+
 
 
 def _resolve_redirect(url, timeout=6):
@@ -4197,17 +4369,48 @@ _CTX_SECTION_RE = re.compile(
     r"###\s*Caveat\s*(?P<caveat>.*)",
     re.S | re.I)
 
+_PORTAL_RE = re.compile(r"PORTAL_TEXT_START\s*(.*?)\s*PORTAL_TEXT_END", re.S | re.I)
+_TRAILING_SECTION_RE = re.compile(
+    r"(SOURCES_USED|LATEST_FILINGS_REVIEWED)\s*:?\s*(.*?)(?=SOURCES_USED|LATEST_FILINGS_REVIEWED|\Z)",
+    re.S | re.I)
+
+
+def _extract_portal_text(raw):
+    """Pull the PORTAL_TEXT_START/_END block if present; otherwise assume
+    the whole response is the portal text (covers older-format saves and
+    plain pasted text that never had markers)."""
+    m = _PORTAL_RE.search(raw or "")
+    return m.group(1).strip() if m else (raw or "").strip()
+
+
+def _extract_trailing_sections(raw):
+    """Best-effort pull of any SOURCES_USED / LATEST_FILINGS_REVIEWED an
+    external AI (or the old prompt format) included in the pasted text.
+    Only meaningful for pasted/external saves \u2014 our own generated calls
+    ignore this and use resolved citation metadata instead."""
+    out = {"sources": None, "filings": None}
+    for label, body in _TRAILING_SECTION_RE.findall(raw or ""):
+        body = body.strip()
+        if not body:
+            continue
+        if label.upper() == "SOURCES_USED":
+            out["sources"] = body
+        else:
+            out["filings"] = body
+    return out
+
 
 def _parse_context_markdown(text):
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        t = t[4:] if t[:4].lower() == "markdown" else t
-    m = _CTX_SECTION_RE.search(t)
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[4:] if raw[:4].lower() == "markdown" else raw
+    portal = _extract_portal_text(raw)
+    m = _CTX_SECTION_RE.search(portal)
     if not m:
-        return {"_unparsed": True, "raw": t}
+        return {"_unparsed": True, "raw": raw}
     d = {k: (v or "").strip() for k, v in m.groupdict().items()}
-    return {
+    res = {
         "what_changed": d["what_changed"],
         "primary_catalyst": d["primary"],
         "secondary_catalyst": (None if d["secondary"].lower().startswith("none") else d["secondary"]),
@@ -4219,6 +4422,11 @@ def _parse_context_markdown(text):
         "investor_question": d["question"],
         "caveat": (None if d["caveat"].lower().startswith("no major caveat") else d["caveat"]),
     }
+    trailing = _extract_trailing_sections(raw)
+    if trailing["sources"] or trailing["filings"]:
+        res["_pasted_sources_raw"] = trailing["sources"]
+        res["_pasted_filings_raw"] = trailing["filings"]
+    return res
 
 
 @st.cache_data(ttl=43200, show_spinner=False)   # cached per (symbol, provider, day)
@@ -4273,15 +4481,27 @@ def _short_url(u):
         return "source"
 
 
-def _render_context_card(res, symbol, name):
+def _render_context_card(res, symbol, name, show_save=True, nested=False):
+    """nested=True means this card is rendering inside the 'Your Offline AI
+    Research' outer expander \u2014 Streamlit doesn't allow expanders nested
+    inside expanders, so sub-sections fall back to st.toggle (same collapsed-
+    by-default feel, just not a container that trips the nesting rule)."""
+    def _collapsible(label, key, render_fn):
+        if nested:
+            if st.toggle(label, key=key, value=False):
+                render_fn()
+        else:
+            with st.expander(label, expanded=False):
+                render_fn()
+
     if res.get("error"):
-        st.warning(f"Couldn't fetch live context ({res['error']}). The copy-prompt route still works, "
-                   "and any filings found are linked below.")
+        st.warning(f"Couldn't fetch live context ({res['error']}). The offline-research route still "
+                   "works, and any filings found are linked below.")
         filings = res.get("filings") or []
         if filings:
-            with st.expander("Sources and Filings"):
-                for f in filings:
-                    st.markdown(f"- [{f['form']} ({f['date']})]({f['url']})")
+            _collapsible("Filings reviewed", f"tog_err_filings_{symbol}",
+                         lambda: [st.markdown(f"- [{f['form']} ({f['date']})]({f['url']})")
+                                 for f in filings])
         return
 
     if res.get("_unparsed"):
@@ -4314,35 +4534,49 @@ def _render_context_card(res, symbol, name):
 
     if res.get("why_it_matters"):
         st.markdown(f"<div style='font-size:.95rem;line-height:1.6;color:{INK};margin:.2rem 0;"
-                    f"max-width:52rem'><b>Why it matters:</b> {res['why_it_matters']}</div>",
+                    f"max-width:52rem'>Why it matters: {res['why_it_matters']}</div>",
                     unsafe_allow_html=True)
 
     iq = res.get("investor_question")
     cav = res.get("caveat")
     if iq or cav:
-        with st.expander("Worth checking before you decide", expanded=False):
+        def _render_worth_checking():
             if iq:
                 st.markdown(f"<div style='font-size:.85rem;color:{MUTED}'>{iq}</div>",
                             unsafe_allow_html=True)
             if cav:
                 st.markdown(f"<div style='font-size:.85rem;color:{MUTED};margin-top:.3rem'>"
-                            f"<i>Caveat:</i> {cav}</div>", unsafe_allow_html=True)
+                            f"Caveat: {cav}</div>", unsafe_allow_html=True)
+        _collapsible("Worth checking before you decide", f"tog_worth_{symbol}", _render_worth_checking)
 
+    # Sources: our own generated calls use real resolved citation metadata;
+    # pasted/external saves show whatever the external AI itself listed,
+    # verbatim, since that's the user's own saved content.
     cites = res.get("citations") or []
+    pasted_sources = res.get("_pasted_sources_raw")
+    if cites:
+        _collapsible("Sources reviewed", f"tog_sources_{symbol}",
+                     lambda: [st.markdown(f"- [{c['title']}]({c['url']})") for c in cites])
+    elif pasted_sources:
+        _collapsible("Sources reviewed", f"tog_sources_{symbol}",
+                     lambda: st.markdown(pasted_sources))
+
     filings = res.get("filings") or []
-    if cites or filings:
-        with st.expander("Sources and Filings", expanded=False):
-            for c in cites:
-                st.markdown(f"- [{c['title']}]({c['url']})")
-            for f in filings:
-                st.markdown(f"- {f['form']} ({f['date']}) \u2014 [SEC filing]({f['url']})")
+    pasted_filings = res.get("_pasted_filings_raw")
+    if filings:
+        _collapsible("Filings reviewed", f"tog_filings_{symbol}",
+                     lambda: [st.markdown(f"- {f['form']} ({f['date']}) \u2014 [SEC filing]({f['url']})")
+                             for f in filings])
+    elif pasted_filings:
+        _collapsible("Filings reviewed", f"tog_filings_{symbol}",
+                     lambda: st.markdown(pasted_filings))
 
     st.caption("Context is aggregated from cited sources \u2014 not a recommendation.")
 
-    key = f"ctxsave_{symbol}_{name}"
-    if st.button("Save this summary", key=f"ctxsavebtn_{symbol}", use_container_width=False):
-        ok = save_research_note(symbol, name, "context", res)
-        st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+    if show_save:
+        if st.button("Save this summary", key=f"ctxsavebtn_{symbol}", use_container_width=False):
+            ok = save_research_note(symbol, name, "context", res)
+            st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
 
 
 def _context_prompt_body(symbol, name):
@@ -4351,32 +4585,76 @@ def _context_prompt_body(symbol, name):
     except Exception:  # noqa: BLE001
         filings = []
     facts = get_context_dashboard_facts(symbol)
-    st.caption("Paste this into Perplexity, Gemini, ChatGPT, or Claude to get the cited briefing for "
-               "free \u2014 it already includes the latest SEC filing links and dashboard numbers.")
-    prompt_text = _build_context_prompt(symbol, name, filings, facts)
-    st.code(prompt_text, language="markdown")
-    st.caption("Ran this externally? Paste the result below to save it for later.")
-    pasted = st.text_area("Paste the AI's response here", key=f"ctxpaste_{symbol}", height=160)
+
+    paste_key = f"ctxpaste_{symbol}"
+    clear_flag = f"_ctxpaste_clear_{symbol}"
+    if st.session_state.get(clear_flag):
+        st.session_state[paste_key] = ""
+        st.session_state[clear_flag] = False
+
+    st.caption("Already ran this externally? Paste the AI's response here and save it under "
+               "**Your Offline AI Research** — no need to scroll past the prompt below.")
+    pasted = st.text_area("Paste the AI's response here", key=paste_key, height=160)
     if st.button("Save pasted response", key=f"ctxpastesave_{symbol}"):
         if pasted.strip():
             ok = save_research_note(symbol, name, "external", {"raw": pasted.strip()})
-            st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+            if ok:
+                st.session_state[clear_flag] = True
+                st.success("Saved.")
+                st.rerun()
+            else:
+                st.warning("Couldn't save \u2014 check GitHub storage setup.")
         else:
             st.warning("Paste something first.")
+
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.7rem 0'>",
+                unsafe_allow_html=True)
+    st.caption("Or copy this prompt into Perplexity, Gemini, ChatGPT, or Claude to get the cited "
+               "briefing for free \u2014 it already includes the latest SEC filing links and "
+               "dashboard numbers.")
+    prompt_text = _build_context_prompt(symbol, name, filings, facts)
+    st.code(prompt_text, language="markdown")
 
 
 if hasattr(st, "dialog"):
     try:
-        _context_prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI",
+        _context_prompt_dialog = st.dialog("AI Prompt for Offline Research",
                                            width="large")(_context_prompt_body)
     except TypeError:
-        _context_prompt_dialog = st.dialog("Research prompt")(_context_prompt_body)
+        _context_prompt_dialog = st.dialog("AI Prompt for Offline Research")(_context_prompt_body)
 else:
     _context_prompt_dialog = _context_prompt_body
 
 
+def _render_saved_notes(symbol, name):
+    """The merged 'Your Offline AI Research' viewer \u2014 shows every saved
+    entry (both in-app generated-and-saved, and pasted-from-elsewhere), each
+    rendered with the same rich card treatment as a live result."""
+    notes = get_saved_notes(symbol)
+    if not notes:
+        return
+    with st.expander(f"Your Offline AI Research ({len(notes)})", expanded=False):
+        for i, n in enumerate(notes):
+            when = (n.get("saved_at") or "")[:16].replace("T", " ")
+            kind = n.get("kind") or "note"
+            data = n.get("data") or {}
+            label = "generated in-app" if kind == "context" else "pasted from offline AI"
+            st.markdown(f"<div style='font-size:.78rem;color:{MUTED};margin-top:.6rem'>"
+                        f"{label} \u00b7 saved {when}</div>", unsafe_allow_html=True)
+            if kind == "context":
+                _render_context_card(data, f"{symbol}_saved{i}", name, show_save=False, nested=True)
+            elif data.get("raw"):
+                parsed = _parse_context_markdown(data["raw"])
+                if parsed.get("_unparsed"):
+                    st.markdown(f"<div style='font-size:.85rem;color:{INK};white-space:pre-wrap'>"
+                                f"{parsed['raw'][:1200]}</div>", unsafe_allow_html=True)
+                else:
+                    _render_context_card(parsed, f"{symbol}_saved{i}", name, show_save=False, nested=True)
+            st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.6rem 0'>",
+                        unsafe_allow_html=True)
+
+
 def render_context(symbol, name):
-    import datetime as _dt
     provider = _context_provider()
     _subgroup("Context \u2014 recent news & filings")
     cc = st.columns([1.7, 1.7, 2.6])
@@ -4384,31 +4662,37 @@ def render_context(symbol, name):
         gen = st.button("Generate latest context", key=f"ctx_{symbol}", use_container_width=True,
                         disabled=(provider is None))
     with cc[1]:
-        if st.button("Copy research prompt", key=f"ctxp_{symbol}", use_container_width=True):
+        if st.button("AI Prompt for Offline Research", key=f"ctxp_{symbol}", use_container_width=True):
             _context_prompt_dialog(symbol, name)
+
     if provider is None:
         st.caption("Add a `PERPLEXITY_API_KEY` or `GEMINI_API_KEY` in Streamlit secrets to enable the "
-                   "in-app briefing \u2014 or use **Copy research prompt** (free, works in any AI).")
+                   "in-app briefing \u2014 or use **AI Prompt for Offline Research** (free, works in "
+                   "any AI).")
+        _render_saved_notes(symbol, name)
         return
+
     cache_key = f"_ctx_cache_{symbol}"
-    if not gen and cache_key not in st.session_state:
+    if gen:
+        if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
+            st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
+                       "Reload to reset, or use AI Prompt for Offline Research instead.")
+        else:
+            st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+            with st.spinner("Reading recent news and filings\u2026"):
+                res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
+            st.session_state[cache_key] = res
+
+    res = st.session_state.get(cache_key)
+    if res:
+        _render_context_card(res, symbol, name)
+    else:
         cap = ("console.perplexity.ai" if provider == "perplexity"
                else "your Google Cloud billing budget")
         st.caption(f"On demand, **{provider}** pulls recent news + the latest SEC filings with "
                    f"citations. Cached per stock per day; set a monthly spend cap in {cap}.")
-        return
-    if gen:
-        if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
-            st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
-                       "Reload to reset, or use the free copy-prompt route.")
-            return
-        st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
-        with st.spinner("Reading recent news and filings\u2026"):
-            res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
-        st.session_state[cache_key] = res
-    res = st.session_state.get(cache_key)
-    if res:
-        _render_context_card(res, symbol, name)
+
+    _render_saved_notes(symbol, name)
 
 
 def get_cached_context(symbol):
