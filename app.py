@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.18.2"
+APP_VERSION = "0.19.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3326,6 +3326,163 @@ def render_top_stocks():
                "yourself.")
 
 
+# ===========================================================================
+# MY STOCK TRACKER — a curated, up-to-30-name watchlist. Reuses the exact same
+# scan/classify/score machinery as Top Stocks to Explore (so a tracked stock
+# gets the same trend read and Focus Priority score), plus when it was added.
+# Stored in the private GitHub data repo; add via a text box or a Track button
+# on any stock's own page; remove from here.
+# ===========================================================================
+
+def _tracker_add():
+    q = st.session_state.get("tracker_add_box", "").strip()
+    st.session_state.tracker_add_box = ""
+    if not q:
+        return
+    sym, _name = _resolve_symbol(q)
+    if sym:
+        ok, msg = add_to_tracker(sym)
+        st.session_state.tracker_add_msg = (ok, f"{sym}: {msg}")
+
+
+def render_tracker():
+    import datetime as _dt
+    section("My Stock Tracker", "your curated watchlist")
+    st.caption("Stocks you've chosen to keep an eye on \u2014 up to 30. Uses the same trend "
+               "classification and Focus Priority scoring as Top Stocks to Explore, so you can spot "
+               "movement in names you already care about, not just what's loudest today.")
+
+    entries = get_tracker()
+    at_cap = len(entries) >= TRACKER_MAX
+
+    c_in, c_btn = st.columns([5, 1])
+    with c_in:
+        st.text_input("Add", key="tracker_add_box", label_visibility="collapsed",
+                      placeholder="Add a company or ticker \u2014 e.g. Amazon or AMZN",
+                      on_change=_tracker_add, disabled=at_cap)
+    with c_btn:
+        st.button("Add", use_container_width=True, on_click=_tracker_add, disabled=at_cap)
+
+    msg = st.session_state.pop("tracker_add_msg", None)
+    if msg:
+        ok, text = msg
+        (st.success if ok else st.warning)(text)
+    if at_cap:
+        st.caption(f"That's the maximum of {TRACKER_MAX} \u2014 remove one below to add another.")
+
+    if not entries:
+        st.info("Nothing tracked yet. Add a stock above, or open any stock's page and use "
+                "**Track this stock**.")
+        return
+
+    added_by_sym = {e["symbol"]: e.get("added", "") for e in entries}
+    symbols = tuple(sorted(added_by_sym.keys()))
+
+    today = _dt.date.today()
+    with st.spinner("Reading trend data for your tracked stocks\u2026"):
+        ranked, _scanned = _run_daily_scan(f"tracker-{today.isoformat()}", symbols)
+
+    ranked_syms = {r["symbol"] for r in ranked}
+    for r in ranked:
+        if "name" not in r:
+            r["name"] = get_company_profile(r["symbol"]).get("name") or r["symbol"]
+            r["why"] = _why_explore(r["m"], r["trend"])
+    ranked.sort(key=lambda r: r["score"], reverse=True)
+
+    # Any tracked symbol without enough price history still needs to show up —
+    # it just can't get a trend read yet, rather than silently vanishing.
+    thin = []
+    for sym in symbols:
+        if sym not in ranked_syms:
+            q = get_quote(sym)
+            thin.append({"symbol": sym, "name": get_company_profile(sym).get("name") or sym,
+                        "price": q.get("price")})
+
+    st.caption(f"Tracking {len(entries)} of {TRACKER_MAX}.")
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
+                unsafe_allow_html=True)
+
+    def _remove_row(sym):
+        ok, msg = remove_from_tracker(sym)
+        st.session_state.tracker_add_msg = (ok, f"{sym}: {msg}")
+
+    for i, r in enumerate(ranked, 1):
+        m = r["m"]
+        c = st.columns([3.0, 1.1, 1.1, 1.1, 0.9, 0.85, 0.85])
+        with c[0]:
+            _px = m.get("price")
+            _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
+                    f"${_px:,.2f}</span>") if _px is not None else ""
+            added = added_by_sym.get(r["symbol"], "")
+            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
+                        f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>"
+                        f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
+                        f"{added or '\u2014'}</div>", unsafe_allow_html=True)
+        with c[1]:
+            st.markdown(_delta_html(m["r1"], "Today"), unsafe_allow_html=True)
+        with c[2]:
+            st.markdown(_delta_html(m["r5"], "5D"), unsafe_allow_html=True)
+        with c[3]:
+            st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
+        with c[4]:
+            vr = m["vol_ratio"]
+            vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
+            vcol = POS if (vr and vr >= 1.3) else MUTED
+            st.markdown(f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
+                        f"text-transform:uppercase'>Vol</div>"
+                        f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
+                        unsafe_allow_html=True)
+        with c[5]:
+            st.button("View \u2192", key=f"trk_view_{r['symbol']}", use_container_width=True,
+                      on_click=_view_stock, args=(r["symbol"],))
+        with c[6]:
+            st.button("Remove", key=f"trk_rm_{r['symbol']}", use_container_width=True,
+                      on_click=_remove_row, args=(r["symbol"],))
+
+        label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
+        b = st.columns([5.0, 1.0])
+        with b[0]:
+            st.markdown(
+                f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
+                f"text-transform:uppercase'>{label}</span>"
+                f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
+                unsafe_allow_html=True)
+        with b[1]:
+            st.markdown(
+                f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
+                f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
+                f"<span style='font-weight:700;font-size:1.1rem;color:{INK}'>{r['score']}</span></div>",
+                unsafe_allow_html=True)
+        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
+                    unsafe_allow_html=True)
+
+    for t in thin:
+        c = st.columns([3.0, 3.3, 0.85, 0.85])
+        with c[0]:
+            _pxs = f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>${t['price']:,.2f}</span>" \
+                if t.get("price") is not None else ""
+            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{t['symbol']}{_pxs}</div>"
+                        f"<div style='color:{MUTED};font-size:.8rem'>{t['name']}</div>"
+                        f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
+                        f"{added_by_sym.get(t['symbol'], '') or '\u2014'}</div>", unsafe_allow_html=True)
+        with c[1]:
+            st.caption("Not enough recent price history yet for a trend read.")
+        with c[2]:
+            st.button("View \u2192", key=f"trk_view_{t['symbol']}", use_container_width=True,
+                      on_click=_view_stock, args=(t["symbol"],))
+        with c[3]:
+            st.button("Remove", key=f"trk_rm_{t['symbol']}", use_container_width=True,
+                      on_click=_remove_row, args=(t["symbol"],))
+        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
+                    unsafe_allow_html=True)
+
+    st.caption("Focus Priority and trend labels use the same logic as Top Stocks to Explore \u2014 a "
+               "starting point for research, not a signal to trade.")
+
+
+
+
+
 
 # ===========================================================================
 # SECTOR MAP + INDUSTRY BENCHMARKS
@@ -3929,21 +4086,35 @@ TRACKER_PATH = "tracker/watchlist.json"
 TRACKER_MAX = 30
 
 
-def get_tracker():
+@st.cache_data(ttl=60, show_spinner=False)   # short TTL: Streamlit reruns on every interaction,
+def get_tracker():                            # so this avoids hitting GitHub on every rerun;
+    """[{'symbol': 'MU', 'added': '2026-07-03'}, ...] in the order they were added."""
     doc, _ = _gh_get_file(TRACKER_PATH)
     return (doc or {}).get("symbols", [])
 
 
+def _tracker_symbols(entries):
+    return [e["symbol"] for e in entries if e.get("symbol")]
+
+
+def is_tracked(symbol):
+    return symbol.upper() in _tracker_symbols(get_tracker())
+
+
 def add_to_tracker(symbol):
+    import datetime as _dt2
     symbol = symbol.upper()
     doc, sha = _gh_get_file(TRACKER_PATH)
     doc = doc or {"symbols": []}
-    if symbol in doc["symbols"]:
+    existing = _tracker_symbols(doc["symbols"])
+    if symbol in existing:
         return True, "Already tracked."
-    if len(doc["symbols"]) >= TRACKER_MAX:
+    if len(existing) >= TRACKER_MAX:
         return False, f"Tracker is full ({TRACKER_MAX} max) \u2014 remove one first."
-    doc["symbols"].append(symbol)
+    doc["symbols"].append({"symbol": symbol, "added": _dt2.date.today().isoformat()})
     ok = _gh_put_file(TRACKER_PATH, doc, sha, message=f"Add {symbol} to tracker")
+    if ok:
+        get_tracker.clear()   # so the UI reflects the change immediately, not after the TTL
     return ok, ("Added." if ok else "Couldn't save \u2014 check GitHub storage setup.")
 
 
@@ -3951,10 +4122,13 @@ def remove_from_tracker(symbol):
     symbol = symbol.upper()
     doc, sha = _gh_get_file(TRACKER_PATH)
     doc = doc or {"symbols": []}
-    if symbol not in doc["symbols"]:
+    existing = _tracker_symbols(doc["symbols"])
+    if symbol not in existing:
         return True, "Not tracked."
-    doc["symbols"].remove(symbol)
+    doc["symbols"] = [e for e in doc["symbols"] if e.get("symbol") != symbol]
     ok = _gh_put_file(TRACKER_PATH, doc, sha, message=f"Remove {symbol} from tracker")
+    if ok:
+        get_tracker.clear()
     return ok, ("Removed." if ok else "Couldn't save \u2014 check GitHub storage setup.")
 
 
@@ -5187,6 +5361,24 @@ def show_ticker(symbol):
     _render_stock_header(symbol, name, industry, exchange, quote)
     render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
 
+    _tracked = is_tracked(symbol)
+    tcol, _sp = st.columns([1.6, 5])
+    with tcol:
+        if _tracked:
+            if st.button("\u2605 Tracked \u2014 remove", key=f"untrack_{symbol}", use_container_width=True):
+                ok, msg = remove_from_tracker(symbol)
+                st.session_state["_track_msg"] = (ok, msg)
+                st.rerun()
+        else:
+            if st.button("\u2606 Track this stock", key=f"track_{symbol}", use_container_width=True):
+                ok, msg = add_to_tracker(symbol)
+                st.session_state["_track_msg"] = (ok, msg)
+                st.rerun()
+    _tmsg = st.session_state.pop("_track_msg", None)
+    if _tmsg:
+        _ok, _text = _tmsg
+        (st.success if _ok else st.warning)(_text)
+
     mode = st.radio("View mode", ["Guide Me", "Metrics"],
                     horizontal=True, key="detail_mode", label_visibility="collapsed")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.1rem 0 .6rem'>",
@@ -5566,6 +5758,10 @@ def _view_top():
     st.session_state.view = {"kind": "top"}
 
 
+def _view_tracker():
+    st.session_state.view = {"kind": "tracker"}
+
+
 # on_click callbacks (below) run at the start of the rerun, before this body,
 # so `view` already reflects the button the person just clicked — no stale state.
 view = st.session_state.get("view", {"kind": "movers", "mover": "gainers"})
@@ -5576,6 +5772,9 @@ on_compare = view.get("kind") == "compare"
 st.sidebar.button("\u2600\ufe0f  Top Stocks to Explore", use_container_width=True,
                   type="primary" if view.get("kind") == "top" else "secondary",
                   on_click=_view_top)
+st.sidebar.button("\u2B50  My Stock Tracker", use_container_width=True,
+                  type="primary" if view.get("kind") == "tracker" else "secondary",
+                  on_click=_view_tracker)
 st.sidebar.markdown("---")
 
 # --- Search ---
@@ -5641,6 +5840,8 @@ if view.get("kind") == "stock":
     show_ticker(view["symbol"])
 elif view.get("kind") == "compare":
     show_comparison()
+elif view.get("kind") == "tracker":
+    render_tracker()
 elif view.get("kind") == "top":
     render_top_stocks()
 else:
