@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.15.0"
+APP_VERSION = "0.16.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3890,28 +3890,47 @@ def get_recent_filings(cik):
     return out
 
 
+
 def _build_context_prompt(symbol, name, filings):
     filing_lines = "\n".join(f"- {f['form']} filed {f['date']}: {f['url']}" for f in filings) \
         or "None retrieved."
     return (
         f"You are writing the \"Context\" section for a personal stock research dashboard. Use web "
-        f"search to identify recent, MATERIAL developments for {symbol} ({name}). Cite sources. Do "
+        f"search to identify recent, material developments for {symbol} ({name}). Cite sources. Do "
         "NOT give buy/sell advice.\n\n"
         f"Most recent SEC filings (summarize the newest 8-K / 10-Q / 10-K only if material):\n"
         f"{filing_lines}\n\n"
         "Priority order: (1) official company announcements / investor-relations, (2) SEC filings "
         "(8-K, 10-Q, 10-K), (3) earnings releases & guidance, (4) reputable news, (5) sector/policy "
         "news only if directly relevant.\n\n"
-        "Return ONLY a JSON object, no markdown fences, with exactly this shape:\n"
-        '{"latest_catalyst":"one-sentence summary of what changed",'
-        '"most_important_event":{"title":"...","source":"...","date":"...","url":"..."},'
-        '"materiality":"High|Medium|Low","why_it_matters":"plain-English",'
-        '"what_to_verify_next":"a specific next check","confidence":"High|Medium|Low",'
+        "Separate the PRIMARY catalyst (the single most important recent development) from any "
+        "SECONDARY one (e.g. a routine financing filing). Do not bundle unrelated events together.\n\n"
+        "Rate TWO kinds of materiality and TWO kinds of confidence \u2014 they are genuinely different:\n"
+        "- event_materiality: strategic importance to the business / investment thesis. A product or "
+        "platform announcement can be strategically High even if it changes no near-term numbers.\n"
+        "- financial_materiality: near-term impact on revenue, margins, guidance, or analyst "
+        "estimates. This is often Medium or Low for announcements until revenue actually shows up; "
+        "reserve High for guidance changes, large financings relative to the company's size, M&A, etc. "
+        "For a mega-cap, a routine debt offering is usually NOT high financial materiality.\n"
+        "- confidence_event_happened: how sure you are the event/filing is real (High if it comes "
+        "from a filing or official source).\n"
+        "- confidence_explains_move: how sure you are this explains any recent stock move. Default to "
+        "Medium \u2014 prices move for many reasons and other news often overlaps; only use High if a "
+        "source directly attributes the move to this event.\n\n"
+        "Return ONLY a JSON object, no markdown fences, exactly this shape:\n"
+        '{"what_changed":"1-2 sentence neutral summary",'
+        '"primary_catalyst":"the single most important development",'
+        '"secondary_catalyst":"a secondary development, or empty string",'
+        '"why_it_matters":"2-3 sentences, plain English, no verdict",'
+        '"investor_question":"the one thing that must be proven next",'
+        '"event_materiality":"High|Medium|Low","financial_materiality":"High|Medium|Low",'
+        '"confidence_event_happened":"High|Medium|Low","confidence_explains_move":"High|Medium|Low",'
         '"warning":"any caveat, or empty string"}\n\n'
         "Rules: say \"may explain\"/\"appears related to\", not \"caused\", unless a source says so. "
         "Distinguish official filings/press releases from media commentary. If no clear catalyst, say "
-        "so in latest_catalyst. If the move looks sector- or policy-driven, label it. Never say buy, "
+        "so in what_changed. If the move looks sector- or policy-driven, label it. Never say buy, "
         "sell, or hold.")
+
 
 
 def _context_via_perplexity(prompt):
@@ -3989,39 +4008,63 @@ def _ctx_tone(level):
     return {"high": "risk", "medium": "caution", "low": "neutral"}.get((level or "").lower(), "neutral")
 
 
+
+def _ctx_level_style(v):
+    v = (v or "").lower()
+    if v == "high":
+        return f"color:{INK};font-weight:700"
+    if v == "medium":
+        return f"color:{INK};font-weight:600"
+    if v == "low":
+        return f"color:{MUTED};font-weight:600"
+    return f"color:{MUTED}"
+
+
+def _ctx_pair(label, a_lab, a_val, b_lab, b_val):
+    def chip(v):
+        return f"<span style='{_ctx_level_style(v)}'>{v or '\u2014'}</span>"
+    return (f"<div style='font-size:.86rem;color:{MUTED};margin:.2rem 0'>"
+            f"<b style='color:{INK};letter-spacing:.03em'>{label}</b> &nbsp; "
+            f"{a_lab}: {chip(a_val)} &nbsp;\u00b7&nbsp; {b_lab}: {chip(b_val)}</div>")
+
+
 def _render_context_card(res, symbol):
     if res.get("error"):
         st.warning(f"Couldn't fetch live context ({res['error']}). The copy-prompt route still works, "
                    "and any filings found are linked below.")
     else:
-        cat = res.get("latest_catalyst") or "No clear recent catalyst was found."
-        st.markdown(
+        wc = res.get("what_changed") or res.get("latest_catalyst") or \
+            "No clear recent catalyst was found."
+        html = (
             f"<div style='border:1px solid {LINE};border-left:3px solid {INK};background:#F7F5EE;"
             f"border-radius:10px;padding:.9rem 1.1rem;margin:.3rem 0 .5rem;max-width:52rem'>"
             f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
             f"margin-bottom:.35rem'>What changed</div>"
-            f"<div style='font-size:1.02rem;line-height:1.5;color:{INK};font-weight:600'>{cat}</div>",
-            unsafe_allow_html=True)
-        ev = res.get("most_important_event") or {}
-        if ev.get("title"):
-            link = (f" \u2014 <a href='{ev.get('url')}' target='_blank'>{ev.get('source') or 'source'}</a>"
-                    if ev.get("url") else "")
-            st.markdown(
-                f"<div style='font-size:.9rem;color:{MUTED};margin-top:.4rem'>Most important: "
-                f"{ev.get('title')}{(' \u00b7 ' + ev.get('date')) if ev.get('date') else ''}{link}</div>"
-                "</div>", unsafe_allow_html=True)
-        else:
-            st.markdown("</div>", unsafe_allow_html=True)
+            f"<div style='font-size:1.02rem;line-height:1.5;color:{INK};font-weight:600'>{wc}</div>")
+        if res.get("primary_catalyst"):
+            html += (f"<div style='font-size:.9rem;color:{INK};margin-top:.45rem'>"
+                     f"<b>Primary catalyst:</b> {res['primary_catalyst']}</div>")
+        if res.get("secondary_catalyst"):
+            html += (f"<div style='font-size:.88rem;color:{MUTED};margin-top:.15rem'>"
+                     f"<b>Secondary:</b> {res['secondary_catalyst']}</div>")
+        html += "</div>"
+        st.markdown(html, unsafe_allow_html=True)
 
-        c = st.columns(2)
-        metric_tile(c[0], "Materiality", res.get("materiality") or "\u2014", "materiality",
-                    status=res.get("materiality"), status_tone=_ctx_tone(res.get("materiality")))
-        with c[1]:
-            st.metric("Confidence", res.get("confidence") or "\u2014")
+        st.markdown(
+            _ctx_pair("Materiality", "strategic", res.get("event_materiality"),
+                      "near-term financial", res.get("financial_materiality"))
+            + _ctx_pair("Confidence", "event happened", res.get("confidence_event_happened"),
+                        "explains the move", res.get("confidence_explains_move")),
+            unsafe_allow_html=True)
+
         if res.get("why_it_matters"):
             _guide_para("<b>Why it matters:</b> " + res["why_it_matters"])
-        if res.get("what_to_verify_next"):
-            _verify_line(res["what_to_verify_next"])
+        iq = res.get("investor_question") or res.get("what_to_verify_next")
+        if iq:
+            st.markdown(
+                f"<div style='font-size:.92rem;line-height:1.6;color:{INK};margin:.2rem 0;"
+                f"max-width:52rem;border-left:2px solid {LINE};padding-left:.7rem'>"
+                f"<b>The question to resolve:</b> {iq}</div>", unsafe_allow_html=True)
         if res.get("warning"):
             st.caption("Note: " + res["warning"])
 
@@ -4037,6 +4080,7 @@ def _render_context_card(res, symbol):
         st.markdown(f"<div style='font-size:.8rem;color:{MUTED};margin:.1rem 0 .3rem'>"
                     f"<b>Latest filings:</b> {fl}</div>", unsafe_allow_html=True)
     st.caption("Context is aggregated from cited sources \u2014 not a recommendation.")
+
 
 
 def _short_url(u):
