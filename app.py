@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.14.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3714,6 +3714,116 @@ def _sector_lens(profile):
     }
 
 
+def _lens_kind(profile):
+    sec = (profile.get("sector") or "").lower()
+    ind = (profile.get("industry") or "").lower()
+    if "semiconductor" in ind or "semiconductor" in sec:
+        return "semi"
+    if ("biotech" in ind or "drug" in ind or "pharmaceutical" in ind
+            or ("healthcare" in sec and ("bio" in ind or "pharma" in ind))):
+        return "biotech"
+    return "generic"
+
+
+def _research_read_text(name, F):
+    rev_g, nm, fcf_y = F["rev_g"], F["nm"], F["fcf_y"]
+    pe, pe_med, peer_pe = F["pe"], F["pe_med"], F["peer_pe"]
+    upside, stretched = F["upside"], F["stretched"]
+    loss, shrink, lens, recovered = F["loss"], F["shrink"], F["lens"], F["recovered"]
+    momentum, beat_str = F["momentum"], F["beat_str"]
+
+    if loss and shrink:
+        situation = {
+            "biotech": f"{name} reads as a pipeline or post-product reset \u2014 a high-risk turnaround, "
+                       "not a steady quality-growth business right now.",
+            "semi": f"{name} reads as a chipmaker in a cyclical trough \u2014 a bet on the next up-cycle, "
+                    "not a steady grower.",
+        }.get(lens, f"{name} reads as a turnaround or reset story right now, not a steady "
+                    "quality-growth business.")
+    elif loss:
+        situation = f"{name} is an early, still-unprofitable growth story."
+    elif lens == "semi" and recovered:
+        situation = f"{name} is a cyclical business riding a strong up-cycle after a recent trough."
+    elif rev_g is not None and rev_g >= 15:
+        situation = f"{name} is a fast-growing, profitable business."
+    else:
+        situation = f"{name} is a profitable business growing at a steadier pace."
+
+    pos, neg = [], []
+    if momentum:
+        pos.append("the stock has strong price momentum")
+    if beat_str:
+        pos.append(beat_str)
+    if rev_g is not None:
+        if rev_g >= 10:
+            pos.append(f"revenue is growing about {abs(rev_g):.0f}%")
+        elif rev_g < 0:
+            neg.append(f"revenue is still shrinking (about {abs(rev_g):.0f}%)")
+    if nm is not None:
+        if nm < 0:
+            neg.append(f"margins are deeply negative ({nm:.0f}%)")
+        elif nm >= 20:
+            pos.append(f"margins are strong ({nm:.0f}%)")
+    if fcf_y is not None:
+        (neg if fcf_y < 0 else pos).append("free cash flow " + ("remains negative" if fcf_y < 0
+                                                                 else "is positive"))
+    if recovered:
+        pos.append("the multi-year trajectory has recovered off its lows")
+    if pe is not None and pe_med is not None and pe > 0:
+        if pe > pe_med * 1.1:
+            neg.append("it trades above its own 5-year valuation range")
+        elif pe < pe_med * 0.9:
+            pos.append("it trades below its own 5-year valuation range")
+    if peer_pe is not None and pe is not None and 0 < pe < peer_pe:
+        pos.append("it's cheaper than its peers")
+    if upside is not None:
+        if upside < 0:
+            neg.append("analyst targets sit below the current price")
+        elif upside >= 15:
+            pos.append(f"analysts see roughly {upside:.0f}% upside to their average target")
+    if stretched:
+        neg.append("the stock looks stretched after a strong run")
+    pos, neg = pos[:3], neg[:3]
+    if pos and neg:
+        syn = _join_clauses(pos) + ", but " + _join_clauses(neg)
+    else:
+        syn = _join_clauses(pos or neg)
+    syn = (syn[0].upper() + syn[1:] + ".") if syn else ""
+
+    if loss and lens == "biotech":
+        q = "whether the pipeline can rebuild durable revenue before cash burn becomes a bigger concern"
+    elif loss and lens == "semi":
+        q = "whether the next up-cycle arrives before cash gets tight"
+    elif loss:
+        q = "whether the business can reach profitability before its cash runs low"
+    elif lens == "semi":
+        q = ("whether this up-cycle is durable or near its peak \u2014 which comes down to whether "
+             "FY26/FY27 estimates keep rising")
+    elif pe is not None and pe_med is not None and pe > pe_med * 1.1:
+        q = "whether growth stays strong enough to justify a price above its own valuation history"
+    else:
+        q = "whether the momentum in the business and estimates holds from here"
+    return situation, syn, q
+
+
+def _render_research_read(name, F):
+    situation, syn, q = _research_read_text(name, F)
+    st.markdown(
+        f"<div style='border:1px solid {LINE};border-left:3px solid {INK};background:#F7F5EE;"
+        f"border-radius:12px;padding:1rem 1.2rem;margin:.3rem 0 1rem;max-width:52rem'>"
+        f"<div style='letter-spacing:.1em;text-transform:uppercase;font-size:.62rem;color:{MUTED};"
+        f"margin-bottom:.45rem'>Research Read</div>"
+        f"<div style='font-size:1.06rem;line-height:1.5;color:{INK};font-weight:600;"
+        f"margin-bottom:.4rem'>{situation}</div>"
+        + (f"<div style='font-size:.97rem;line-height:1.6;color:{INK};margin-bottom:.55rem'>{syn}</div>"
+           if syn else "")
+        + f"<div style='font-size:.95rem;line-height:1.55;color:{INK};border-top:1px solid {LINE};"
+        f"padding-top:.55rem'><b>The question to resolve:</b> {q}.</div>"
+        f"<div style='font-size:.77rem;color:{MUTED};margin-top:.5rem'>A synthesis of the data below "
+        "\u2014 not a recommendation. It frames what to research; the call is yours.</div></div>",
+        unsafe_allow_html=True)
+
+
 def render_guided(symbol, quote, profile, metrics):
     sym = symbol.upper()
     name = profile.get("name") or sym
@@ -3721,11 +3831,11 @@ def render_guided(symbol, quote, profile, metrics):
     # ---- top controls: AI toggle + free copy-prompt ----
     cc = st.columns([1.5, 1.7, 2.8])
     with cc[0]:
-        ai_on = st.checkbox("\u2728 AI-powered", key=f"guide_ai_{sym}",
+        ai_on = st.checkbox("AI-powered", key=f"guide_ai_{sym}",
                             help="Let Claude write the analysis instead of the built-in guide. "
                                  "Uses your Anthropic API key (a few cents per run).")
     with cc[1]:
-        if st.button("\U0001f4cb Research prompt", key=f"guide_prompt_{sym}",
+        if st.button("Research prompt", key=f"guide_prompt_{sym}",
                      use_container_width=True,
                      help="Copy a ready-made prompt containing all the numbers, to paste into any "
                           "AI chat \u2014 no API cost."):
@@ -3756,6 +3866,38 @@ def render_guided(symbol, quote, profile, metrics):
     loss_making = (_nm0 is not None and _nm0 < 0) or (_pe0 is not None and _pe0 < 0)
     shrinking = _rev0 is not None and _rev0 < 0
     lens = _sector_lens(profile)
+
+    # ---- Research Read: the top-of-page synthesis (Slice 2) ----
+    _bench = get_industry_benchmark(sym)
+    _peer_pe = None
+    if _bench:
+        for _r in _bench["rows"]:
+            if _r["key"] == "pe":
+                _peer_pe = to_float(_r.get("median"))
+    _rsi = to_float(tech.get("rsi"))
+    _dlow = to_float(tech.get("dist_low")) or 0
+    _rev_s = [to_float(x) for x in (traj.get("metrics") or {}).get("revenue", [])
+              if to_float(x) is not None]
+    _recovered = (len(_rev_s) >= 3 and min(_rev_s) < _rev_s[0]
+                  and _rev_s[-1] > min(_rev_s) * 1.3
+                  and 0 < _rev_s.index(min(_rev_s)) < len(_rev_s) - 1)
+    _la = ea.get("last") or {}
+    _eaa, _eae = to_float(_la.get("eps_actual")), to_float(_la.get("eps_est"))
+    _beat_str = ""
+    if _eaa is not None and _eae is not None and _eaa > _eae:
+        _beat_str = "recently reported a smaller-than-expected loss" if _eaa < 0 else "recently beat earnings"
+    _render_research_read(name, {
+        "rev_g": to_float(gro.get("revenue")), "nm": to_float(metrics.get("net_margin_pct")),
+        "fcf_y": to_float(cur.get("fcf_yield")), "pe": to_float(cur.get("pe")),
+        "pe_med": to_float((hist.get("pe") or {}).get("median")), "peer_pe": _peer_pe,
+        "upside": to_float((an.get("target") or {}).get("upside")),
+        "stretched": (_rsi is not None and _rsi >= 70)
+                     or bool(tech.get("above_50") and tech.get("above_200") and _dlow > 100),
+        "momentum": (_rsi is not None and _rsi >= 60)
+                    or bool(tech.get("above_200") and _dlow > 50),
+        "loss": loss_making, "shrink": shrinking, "lens": _lens_kind(profile),
+        "recovered": _recovered, "beat_str": _beat_str,
+    })
 
     # ---- how to read this stock ----
     st.markdown(
@@ -4151,11 +4293,11 @@ def show_ticker(symbol):
     _render_stock_header(symbol, name, industry, exchange, quote)
     render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
 
-    mode = st.radio("View mode", ["\U0001f9ed Guide Me", "\U0001f4ca Metrics"],
+    mode = st.radio("View mode", ["Guide Me", "Metrics"],
                     horizontal=True, key="detail_mode", label_visibility="collapsed")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.1rem 0 .6rem'>",
                 unsafe_allow_html=True)
-    if mode.startswith("\U0001f9ed"):
+    if mode == "Guide Me":
         render_guided(symbol, quote, profile, metrics)
         return
 
