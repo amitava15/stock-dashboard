@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.11.4"
+APP_VERSION = "0.12.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3533,6 +3533,346 @@ def render_industry_benchmark(symbol):
 
 
 
+# ===========================================================================
+# GUIDE ME  —  a guided research journey (toggle alternative to the metric tabs)
+# Walks the stock in the order a teacher would: what changed -> is the business
+# improving -> does it make cash -> is the price fair -> what the market expects
+# -> risk & timing. Every step shows the number, then explains it in plain
+# English: the facts, what the pattern usually means (both ways), and what to
+# verify next. It never issues a buy/sell verdict. An opt-in checkbox swaps in
+# an AI-written version; a copy-prompt button exports all the numbers so you can
+# run your own AI report for free.
+# ===========================================================================
+
+def _build_research_prompt(symbol):
+    company = symbol.upper()
+    raw = _analysis_json(symbol)
+    return (
+        f"You are helping me research {company} for my own investment decision. Below is a JSON "
+        "snapshot of the company's current data, pulled from my research dashboard.\n\n"
+        "Write a detailed, plain-English research report a thoughtful beginner could follow. Walk "
+        "these areas in order: (1) what recently changed, (2) business quality, (3) cash "
+        "generation, (4) valuation, (5) what the market already expects, (6) risk & timing. For "
+        "EACH area:\n"
+        "  a. State the facts from the data.\n"
+        "  b. Explain what that pattern usually means \u2014 give BOTH the bullish and the bearish "
+        "reading.\n"
+        "  c. Say what I should verify next, and why it matters.\n\n"
+        "Then give a clear Bull Case and Bear Case, and finish with the 3\u20135 open questions that "
+        "would settle the debate between them.\n\n"
+        "Do NOT tell me to buy, sell, or hold. Explain the numbers so I can decide for myself. Point "
+        "out anything in the data that looks extreme, cyclical, or internally inconsistent so I don't "
+        "take it at face value.\n\n"
+        f"DATA (JSON):\n{raw}\n"
+    )
+
+
+def _prompt_dialog(symbol):
+    st.caption("Copy this into Claude.ai, ChatGPT, or any AI chat to get a full written report with "
+               "**no API cost**. It already contains every number from this page.")
+    st.code(_build_research_prompt(symbol), language="markdown")
+    st.caption("Use the copy button at the top-right of the box, then paste it into your AI of choice.")
+
+
+# Present as a modal where Streamlit supports it; otherwise it renders inline (still works).
+if hasattr(st, "dialog"):
+    try:
+        _prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI", width="large")(_prompt_dialog)
+    except TypeError:
+        _prompt_dialog = st.dialog("Research prompt \u2014 paste into any AI")(_prompt_dialog)
+
+
+def _guide_para(text):
+    st.markdown(
+        f"<div style='font-size:1rem;line-height:1.65;color:{INK};margin:.3rem 0 .2rem;"
+        f"max-width:52rem'>{text}</div>", unsafe_allow_html=True)
+
+
+def _verify_line(text):
+    st.markdown(
+        f"<div style='font-size:.92rem;line-height:1.6;color:{INK};margin:.15rem 0 .2rem;"
+        f"max-width:52rem;border-left:2px solid {LINE};padding-left:.7rem'>"
+        f"<b>Worth checking before you decide:</b> {text}</div>", unsafe_allow_html=True)
+
+
+def _handoff(text):
+    st.markdown(
+        f"<div style='font-size:.9rem;color:{MUTED};margin:.5rem 0 .1rem;font-style:italic'>"
+        f"{text}</div>", unsafe_allow_html=True)
+
+
+def render_guided(symbol, quote, profile, metrics):
+    sym = symbol.upper()
+    name = profile.get("name") or sym
+
+    # ---- top controls: AI toggle + free copy-prompt ----
+    cc = st.columns([1.5, 1.7, 2.8])
+    with cc[0]:
+        ai_on = st.checkbox("\u2728 AI-powered", key=f"guide_ai_{sym}",
+                            help="Let Claude write the analysis instead of the built-in guide. "
+                                 "Uses your Anthropic API key (a few cents per run).")
+    with cc[1]:
+        if st.button("\U0001f4cb Research prompt", key=f"guide_prompt_{sym}",
+                     use_container_width=True,
+                     help="Copy a ready-made prompt containing all the numbers, to paste into any "
+                          "AI chat \u2014 no API cost."):
+            _prompt_dialog(sym)
+
+    if ai_on:
+        st.caption("AI mode: Claude reads every number and writes the report. It gives a research "
+                   "*view* (with disclaimers); the built-in guide below stays verdict-free \u2014 "
+                   "untick to return to it.")
+        render_ai_analysis(sym)
+        return
+
+    # ---- data (reuses the same functions the metric tabs use) ----
+    val = get_valuation_growth(sym)
+    an = get_analyst(sym)
+    ea = get_earnings_context(sym)
+    tech = get_technicals(sym)
+    cur, gro, hist = val["current"], val["growth"], val["history"]
+
+    # ---- how to read this stock ----
+    st.markdown(
+        f"<div style='background:rgba(122,121,112,.06);border:1px solid {LINE};border-radius:10px;"
+        f"padding:.9rem 1.1rem;margin:.5rem 0 .3rem;max-width:52rem'>"
+        f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.62rem;color:{MUTED};"
+        f"margin-bottom:.35rem'>How to read this stock</div>"
+        f"<div style='font-size:.95rem;line-height:1.6;color:{INK}'>Good research follows an order. "
+        "First check <b>what just changed</b>, then whether the <b>business is improving</b>, then "
+        "whether profits turn into <b>real cash</b>, then whether the <b>price already reflects</b> "
+        "the good news, and finally the <b>risk and timing</b>. Each step below shows the number, "
+        "then explains it \u2014 and points you to the next thing to check.</div></div>",
+        unsafe_allow_html=True)
+
+    # ======================= 1 · WHAT JUST CHANGED =======================
+    section("What just changed?", "step 1 \u00b7 the catalyst")
+    last, nxt = ea.get("last") or {}, ea.get("next") or {}
+    c = st.columns(3)
+    ea_a, ea_e = to_float(last.get("eps_actual")), to_float(last.get("eps_est"))
+    beat = ((ea_a / ea_e - 1) * 100) if (ea_a is not None and ea_e) else None
+    beat_txt = (f"{money(ea_a)} vs {money(ea_e)} est"
+                + (f" \u00b7 {'beat' if beat >= 0 else 'missed'} {abs(beat):.0f}%" if beat is not None else "")
+                ) if ea_a is not None else "n/a"
+    with c[0]:
+        st.metric("Last EPS (actual vs est.)", beat_txt if ea_a is not None else "\u2014")
+    with c[1]:
+        st.metric("Next earnings", str(nxt.get("date") or "\u2014"))
+    with c[2]:
+        st.metric("Days away", str(nxt.get("days")) if nxt.get("days") is not None else "\u2014")
+    if ea_a is not None and beat is not None:
+        verb = "beat" if beat >= 0 else "came in under"
+        _guide_para(
+            f"In its most recent quarter, {name} reported earnings of {money(ea_a)} a share against "
+            f"the {money(ea_e)} analysts expected \u2014 it {verb} the estimate by about "
+            f"{abs(beat):.0f}%. Earnings are where a story is confirmed or broken, so a beat says the "
+            "business is running ahead of what the market had modeled; a miss says the opposite. One "
+            "quarter isn't a trend, though \u2014 a single beat can come from a one-off, and a single "
+            "miss from timing.")
+    else:
+        _guide_para(
+            f"There isn't clean actual-vs-estimate data for {name}'s last quarter on the current data "
+            "tier, so treat the 'what changed' picture as incomplete and lean on the business and "
+            "cash sections below.")
+    if nxt.get("date"):
+        _verify_line(
+            f"whether that last surprise came from durable demand or a one-off \u2014 and whether "
+            f"estimates for the next report ({nxt.get('date')}) are drifting up or down heading in. "
+            "Rising estimates into a print is a stronger signal than the beat itself.")
+    _handoff("A good quarter only matters if the business behind it is actually getting stronger \u2014 "
+             "so next, the trajectory.")
+
+    # ======================= 2 · IS THE BUSINESS IMPROVING =======================
+    section("Is the business improving?", "step 2 \u00b7 quality & trend")
+    rev_g = to_float(gro.get("revenue"))
+    nm, gm = to_float(metrics.get("net_margin_pct")), to_float(metrics.get("gross_margin_pct"))
+    roe = to_float(metrics.get("roe_pct"))
+    c = st.columns(3)
+    _s, _t = _sign_signal(rev_g)
+    metric_tile(c[0], "Revenue Growth (YoY)", pct(rev_g), "revenue_growth", status=_s, status_tone=_t)
+    _s, _t = _margin_signal(nm, gross=False)
+    metric_tile(c[1], "Net Margin", pct(nm), "net_margin", status=_s, status_tone=_t)
+    _s, _t = _roe_signal(roe)
+    metric_tile(c[2], "Return on Equity", pct(roe), "roe", status=_s, status_tone=_t)
+    bits = []
+    if rev_g is not None:
+        bits.append(f"revenue is {'growing' if rev_g > 0 else 'shrinking'} about {abs(rev_g):.0f}% "
+                    "year over year")
+    if nm is not None:
+        bits.append(f"it keeps roughly {nm:.0f}\u00a2 of every sales dollar as profit (net margin)")
+    if roe is not None:
+        bits.append(f"and earns about {roe:.0f}% on shareholders' equity")
+    if bits:
+        _guide_para(
+            (name + " is " + ", ".join(bits) + ". ").replace(" is revenue", " has revenue that")
+            + "High and rising margins with strong returns usually mean real pricing power and a "
+            "business getting more efficient. The catch: if the company is cyclical, today's fat "
+            "margins can be the <i>top</i> of the cycle, not the new normal \u2014 which flatters "
+            "every profitability number at once.")
+    else:
+        _guide_para("Profitability data is thin for this one on the current tier \u2014 check the "
+                    "Business tab's multi-year trajectory to see the direction.")
+    _verify_line(
+        "whether margins are still <i>rising</i> or just <i>high</i>. Pull up the multi-year "
+        "trajectory: steadily climbing margins are quality; a sharp spike after a slump is often "
+        "cyclical, and cyclical peaks don't last.")
+    _handoff("Profit on paper isn't the same as money in the bank \u2014 so next, does it turn into "
+             "cash?")
+
+    # ======================= 3 · DOES IT MAKE REAL CASH =======================
+    section("Does it make real cash?", "step 3 \u00b7 cash generation")
+    fcf_y = to_float(cur.get("fcf_yield"))
+    fcf_g = to_float(gro.get("fcf"))
+    c = st.columns(2)
+    _s, _t = _sign_signal(fcf_y, pos="healthy", neg="negative")
+    metric_tile(c[0], "FCF Yield", pct(fcf_y), "fcf_yield", status=_s, status_tone=_t)
+    _s, _t = _sign_signal(fcf_g)
+    metric_tile(c[1], "FCF Growth (YoY)", pct(fcf_g), "fcf_growth", status=_s, status_tone=_t)
+    if fcf_y is not None or fcf_g is not None:
+        _guide_para(
+            "Free cash flow is what's left after the company pays to keep the lights on and invest in "
+            "growth \u2014 it's harder to fake than accounting profit. "
+            + (f"Here the free-cash-flow yield is about {fcf_y:.1f}%, "
+               "meaning that's what the business throws off in cash relative to its price. " if fcf_y is not None else "")
+            + (f"Cash flow is {'up' if (fcf_g or 0) > 0 else 'down'} about {abs(fcf_g):.0f}% "
+               "year over year. " if fcf_g is not None else "")
+            + "Profit that doesn't become cash is a yellow flag; cash that grows alongside profit is "
+            "the real thing. In capital-heavy businesses, watch how much gets eaten by capital "
+            "spending before it ever reaches free cash flow.")
+    else:
+        _guide_para("Cash-flow figures aren't available on the current tier for this one \u2014 the "
+                    "Business tab's Cash Generation charts show the multi-year shape.")
+    _verify_line(
+        "whether free cash flow tracks reported profit over the last few years. If profit rises but "
+        "cash doesn't, ask where the money is going \u2014 usually capital spending or working "
+        "capital \u2014 and whether that's temporary or the nature of the business.")
+    _handoff("A strong, cash-generating business can still be a poor investment if you overpay \u2014 "
+             "so next, the price.")
+
+    # ======================= 4 · IS THE PRICE FAIR =======================
+    section("Is the price fair?", "step 4 \u00b7 valuation")
+    pe = to_float(cur.get("pe"))
+    fwd = to_float(cur.get("forward_pe"))
+    pe_med = to_float((hist.get("pe") or {}).get("median"))
+    c = st.columns(3)
+    _s, _t = _valuation_signal(pe, "pe")
+    metric_tile(c[0], "P/E (TTM)", num(pe), "pe", status=_s, status_tone=_t)
+    metric_tile(c[1], "Forward P/E", num(fwd), "forward_pe")
+    with c[2]:
+        st.metric("Own 5-yr median P/E", num(pe_med) if pe_med is not None else "\u2014")
+    bench = get_industry_benchmark(sym)
+    peer_pe = None
+    if bench:
+        for row in bench["rows"]:
+            if row["key"] == "pe":
+                peer_pe = row
+                break
+    # facts -> both readings -> what to verify  (the locked template)
+    facts = []
+    if pe is not None and pe_med is not None:
+        rel = "above" if pe > pe_med else "below"
+        facts.append(f"{sym}'s P/E of {num(pe)} sits {rel} its own 5-year median of {num(pe_med)}")
+    if peer_pe and peer_pe.get("median") is not None and pe is not None:
+        rel = "below" if pe < peer_pe["median"] else "above"
+        facts.append(f"and {rel} its peer median of {num(peer_pe['median'])}\u00d7")
+    if facts:
+        _guide_para(
+            " ".join(facts).capitalize() + ". "
+            + ("A stock above its own history but below its peers usually means one of two things: "
+               "either the market expects its earnings to keep climbing (so today's price is cheap "
+               "against <i>tomorrow's</i> profit), or the whole peer group is simply expensive right "
+               "now. "
+               if (pe is not None and pe_med is not None and peer_pe and pe < (peer_pe.get('median') or 0) and pe > pe_med)
+               else "The gap between what a stock trades at, its own history, and its peers is the "
+                    "heart of the valuation question \u2014 a high multiple is only justified if "
+                    "growth is real and durable. ")
+            + (f"The forward P/E of {num(fwd)} \u2014 lower than the trailing {num(pe)} \u2014 tells "
+               "you analysts expect earnings to rise, which is exactly the bet embedded in the price. "
+               if (fwd is not None and pe is not None and fwd < pe) else ""))
+    else:
+        _guide_para("Valuation multiples are incomplete for this one on the current tier \u2014 the "
+                    "Valuation tab shows whatever is available plus the peer benchmark.")
+    _verify_line(
+        "which of those two readings is true \u2014 and that comes down to the estimates. Are FY26/"
+        "FY27 earnings forecasts still <i>rising</i>? If they are, a below-peer multiple on growing "
+        "profit is one story; if they're being cut, the 'cheap on forward earnings' case quietly "
+        "falls apart.")
+    _handoff("Price only makes sense against expectations \u2014 so next, what is the market already "
+             "counting on?")
+
+    # ======================= 5 · WHAT THE MARKET EXPECTS =======================
+    section("What does the market expect?", "step 5 \u00b7 expectations")
+    tgt = an.get("target") or {}
+    grades = an.get("grades") or {}
+    upside = to_float(tgt.get("upside"))
+    n_buy = sum(to_float(grades.get(k)) or 0 for k in ("strongBuy", "buy"))
+    n_hold = to_float(grades.get("hold")) or 0
+    n_sell = sum(to_float(grades.get(k)) or 0 for k in ("sell", "strongSell"))
+    c = st.columns(3)
+    with c[0]:
+        st.metric("Analyst consensus", str(an.get("consensus") or "\u2014"))
+    metric_tile(c[1], "Avg price target", money(tgt.get("avg")), "price_target")
+    _s, _t = _sign_signal(upside, pos="upside", neg="downside")
+    metric_tile(c[2], "Implied upside", pct(upside), "implied_upside", status=_s, status_tone=_t)
+    _guide_para(
+        (f"Analysts lean {'bullish' if n_buy > (n_hold + n_sell) else 'mixed'} here \u2014 roughly "
+         f"{int(n_buy)} buy, {int(n_hold)} hold, {int(n_sell)} sell. " if (n_buy or n_hold or n_sell) else "")
+        + (f"Their average target implies about {upside:.0f}% "
+           f"{'upside' if upside >= 0 else 'downside'} from here. " if upside is not None else "")
+        + "Consensus tells you what's already <i>priced in</i> \u2014 which cuts both ways. When "
+        "everyone is bullish, a lot of good news is already in the stock, so it takes an even bigger "
+        "surprise to push it higher, and a stumble can hurt more. Targets also cluster and get "
+        "revised after the fact, so treat them as a mood reading, not a forecast.")
+    _verify_line(
+        "the <i>direction</i> of estimate revisions, not the level. Are analysts raising or cutting "
+        "revenue and EPS forecasts over the last few months? Rising revisions into a bullish "
+        "consensus is a genuine tailwind; falling revisions behind a bullish consensus is a warning.")
+    _handoff("Finally, even a fair price on a great business can be a rough entry if the setup is "
+             "stretched \u2014 so last, risk and timing.")
+
+    # ======================= 6 · RISK & TIMING =======================
+    section("Is the timing calm or stretched?", "step 6 \u00b7 risk & timing")
+    rsi = to_float(tech.get("rsi"))
+    dist_high = to_float(tech.get("dist_high"))
+    beta = to_float(metrics.get("beta"))
+    c = st.columns(3)
+    _s, _t = _rsi_signal(rsi)
+    metric_tile(c[0], "RSI (14)", num(rsi), "rsi", status=_s, status_tone=_t)
+    with c[1]:
+        st.metric("From 52-wk high", pct(dist_high) if dist_high is not None else "\u2014")
+    _s, _t = _beta_signal(beta)
+    metric_tile(c[2], "Beta", num(beta), "beta", status=_s, status_tone=_t)
+    _guide_para(
+        (f"Momentum (RSI) sits at {rsi:.0f}"
+         + (" \u2014 in the stretched zone above 70, meaning the stock has run hard and fast" if (rsi or 0) >= 70
+            else " \u2014 in the washed-out zone below 30, meaning it's been sold off hard" if (0 < (rsi or 0) <= 30)
+            else " \u2014 in a neutral range") + ". " if rsi is not None else "")
+        + (f"It's about {abs(dist_high):.0f}% {'below' if (dist_high or 0) < 0 else 'above'} its "
+           "52-week high. " if dist_high is not None else "")
+        + (f"A beta near {beta:.1f} means it tends to move {'more' if (beta or 0) > 1.2 else 'about as much' if 0.8 <= (beta or 0) <= 1.2 else 'less'} "
+           "than the market. " if beta is not None else "")
+        + "None of this is a buy or sell trigger \u2014 it describes the <i>entry conditions</i>. A "
+        "stretched, high-beta name can keep running or snap back hard; a calm one gives you more "
+        "room. Timing is about position size and patience, not about whether the business is good.")
+    _verify_line(
+        "whether a stretched reading is backed by fundamentals or just enthusiasm. If the run-up came "
+        "with rising earnings and estimates, it's momentum with a reason; if the price moved but the "
+        "fundamentals didn't, the timing risk is real.")
+
+    # ---- close ----
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:1.2rem 0 .6rem'>",
+                unsafe_allow_html=True)
+    _guide_para(
+        "That's the whole story, in order: what changed, whether the business and its cash are "
+        "improving, whether the price already reflects it, what the market expects, and how stretched "
+        "the setup is. The dashboard's job ends here \u2014 it lays out the evidence and the open "
+        f"questions. The decision on {sym} is yours to make.")
+    st.caption("Want a second read? Tick **AI-powered** above, or use **Research prompt** to run a "
+               "full report in your own AI for free. Switch to **Metrics** (top) for every number and "
+               "chart behind this walkthrough.")
+
+
+
 def show_ticker(symbol):
     symbol = symbol.upper().strip()
 
@@ -3555,6 +3895,14 @@ def show_ticker(symbol):
     st.markdown(_STOCK_PAGE_CSS, unsafe_allow_html=True)
     _render_stock_header(symbol, name, industry, exchange, quote)
     render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
+
+    mode = st.radio("View mode", ["\U0001f9ed Guide Me", "\U0001f4ca Metrics"],
+                    horizontal=True, key="detail_mode", label_visibility="collapsed")
+    st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.1rem 0 .6rem'>",
+                unsafe_allow_html=True)
+    if mode.startswith("\U0001f9ed"):
+        render_guided(symbol, quote, profile, metrics)
+        return
 
     tab_overview, tab_business, tab_valuation, tab_market, tab_notes, tab_ai = st.tabs(
         ["Overview", "Business", "Valuation", "Market", "Notes", "AI"]
