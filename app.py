@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.11.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3136,7 +3136,23 @@ def get_industry_benchmark(symbol, max_peers=10):
     if not rows:
         return None
     return {"industry": industry, "sector": sector, "grouping": grouping,
-            "n_peers": len(peers), "rows": rows}
+            "n_peers": len(peers),
+            "peers": [{"symbol": p, "name": (umap.get(p, {}).get("name") or p)} for p in peers],
+            "rows": rows}
+
+
+def _fmt_bench(v, unit):
+    if v is None:
+        return "\u2014"
+    return f"{v:,.1f}\u00d7" if unit == "x" else f"{v:,.1f}%"
+
+
+def _short_name(n):
+    for suf in (", Incorporated", " Incorporated", ", Inc.", " Inc.", " Corporation",
+                " Corp.", ", Ltd.", " Ltd.", " Company", " plc", " N.V.", " S.A.", " Co."):
+        if n.endswith(suf):
+            return n[:-len(suf)]
+    return n
 
 
 def render_industry_benchmark(symbol):
@@ -3147,47 +3163,44 @@ def render_industry_benchmark(symbol):
     grp = b["industry"] if (b["grouping"] != "sector" and b["industry"]) else b["sector"]
     _subgroup("Versus Industry Peers")
     st.caption(f"Where {symbol.upper()} sits against **{b['n_peers']} {grp or 'sector'} peers** of "
-               "similar size — peer median, with the 25th\u201375th percentile range. Context for "
-               "research, not a verdict: peers share an industry but not always a business model, and "
-               "a whole sector can run rich or cheap at once.")
-    for row in b["rows"]:
-        unit = row["unit"]
+               "similar size — the peer median and 25th\u201375th percentile range sit beneath each "
+               "metric. Context for research, not a verdict: peers share an industry but not always a "
+               "business model, and a whole sector can run rich or cheap at once.")
 
-        def fmt(v):
-            if v is None:
-                return "\u2014"
-            return f"{v:,.1f}\u00d7" if unit == "x" else f"{v:,.1f}%"
+    # the peer set — name & ticker
+    peer_bits = " \u00b7 ".join(
+        f"<b>{p['symbol']}</b> <span style='color:{MUTED}'>{_short_name(p['name'])}</span>"
+        for p in b["peers"])
+    st.markdown(
+        f"<div style='font-size:.83rem;margin:.15rem 0 .8rem;line-height:1.7'>"
+        f"<span style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;"
+        f"color:{MUTED}'>Peer set</span>&nbsp;&nbsp;{peer_bits}</div>",
+        unsafe_allow_html=True)
 
-        tgt, p25, p75 = row["target"], row["p25"], row["p75"]
-        pos, pcol = "", MUTED
-        if tgt is not None and p25 is not None and p75 is not None:
-            if tgt > p75:
-                pos = "above peers"
-                pcol = POS if row["higher"] else NEG
-            elif tgt < p25:
-                pos = "below peers"
-                pcol = NEG if row["higher"] else POS
-            else:
-                pos = "in the pack"
-        c = st.columns([1.7, 1.15, 2.15])
-        with c[0]:
-            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
-                        f"text-transform:uppercase'>{row['label']}</div>"
-                        f"<div style='font-weight:600;font-size:1.05rem'>{fmt(tgt)}</div>",
-                        unsafe_allow_html=True)
-        with c[1]:
-            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
-                        f"text-transform:uppercase'>Peer median</div>"
-                        f"<div style='font-size:1.02rem'>{fmt(row['median'])}</div>",
-                        unsafe_allow_html=True)
-        with c[2]:
-            postxt = (f"<span style='color:{pcol};font-weight:600'> \u00b7 {pos}</span>"
-                      if pos else "")
-            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
-                        f"text-transform:uppercase'>Peer range ({row['n']})</div>"
-                        f"<div style='color:{MUTED};font-size:.92rem'>{fmt(p25)} \u2013 {fmt(p75)}"
-                        f"{postxt}</div>", unsafe_allow_html=True)
-        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.35rem 0'>",
+    rows = b["rows"]
+    for i in range(0, len(rows), 3):
+        cols = st.columns(3)
+        for col, row in zip(cols, rows[i:i + 3]):
+            unit = row["unit"]
+            tgt, p25, p75 = row["target"], row["p25"], row["p75"]
+            pos, pcol = "", MUTED
+            if tgt is not None and p25 is not None and p75 is not None:
+                if tgt > p75:
+                    pos, pcol = "above peers", (POS if row["higher"] else NEG)
+                elif tgt < p25:
+                    pos, pcol = "below peers", (NEG if row["higher"] else POS)
+                else:
+                    pos = "in the pack"
+            with col:
+                st.metric(row["label"], _fmt_bench(tgt, unit))
+                postxt = (f"<span style='color:{pcol};font-weight:600'> \u00b7 {pos}</span>"
+                          if pos else "")
+                st.markdown(
+                    f"<div style='color:{MUTED};font-size:.79rem;margin-top:-.7rem;line-height:1.5'>"
+                    f"Peers {_fmt_bench(row['median'], unit)} \u00b7 "
+                    f"{_fmt_bench(p25, unit)}\u2013{_fmt_bench(p75, unit)}{postxt}</div>",
+                    unsafe_allow_html=True)
+        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.5rem 0 .7rem'>",
                     unsafe_allow_html=True)
 
 
