@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.10.2"
+APP_VERSION = "0.11.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1363,7 @@ def render_valuation_growth(symbol):
     hist_tile(c[2], "P/S now", hist["ps"], "ps_vs_median")
 
     st.caption(_valuation_read(d))
-    st.caption("Comparison to a *peer* median is coming with the Peer Context section.")
+    render_industry_benchmark(symbol)
 
 
 def _consensus_bar(grades):
@@ -2149,11 +2149,27 @@ def show_movers(kind):
             df = df.rename(columns={cand: "changePct"})
             break
     keep = [c for c in ["symbol", "name", "price", "changePct"] if c in df.columns]
-    df = df[keep].head(15).copy()
+    df = df[keep].copy()
+
+    # --- sector filter (independent per movers tab) ---
+    umap = get_universe_map()
+    if "symbol" in df.columns and umap:
+        df["Sector"] = df["symbol"].map(
+            lambda s: umap.get(str(s).upper(), {}).get("sector") or "")
+        opts = ["All sectors"] + sorted(x for x in df["Sector"].unique() if x)
+        if len(opts) > 1:
+            sel = st.selectbox("Sector", opts, key=f"sector_{kind}", label_visibility="collapsed")
+            if sel != "All sectors":
+                df = df[df["Sector"] == sel]
+
+    df = df.head(15).copy()
     if "changePct" in df.columns:
         df["changePct"] = df["changePct"].map(to_float)
     df = df.rename(columns={"symbol": "Symbol", "name": "Company",
                             "price": "Price ($)", "changePct": "Change %"})
+    if df.empty:
+        st.caption("No names in that sector among today's movers.")
+        return
     st.dataframe(df, hide_index=True, use_container_width=True, column_config={
         "Price ($)": st.column_config.NumberColumn(format="$%.2f"),
         "Change %": st.column_config.NumberColumn(format="%.2f%%"),
@@ -2899,14 +2915,25 @@ def render_top_stocks():
                 "price history is briefly unavailable — try again in a moment.")
         return
 
-    direction = st.radio("Direction", ["Rising", "Falling", "Both"], horizontal=True,
-                         index=0, label_visibility="collapsed", key="top_direction")
+    umap = get_universe_map()
+    for r in ranked:
+        r["sector"] = umap.get(r["symbol"], {}).get("sector") or "Other"
+    secs = ["All sectors"] + sorted({r["sector"] for r in ranked
+                                     if r["sector"] and r["sector"] != "Other"})
+    fcol = st.columns([1.35, 1.0])
+    with fcol[0]:
+        direction = st.radio("Direction", ["Rising", "Falling", "Both"], horizontal=True,
+                             index=0, label_visibility="collapsed", key="top_direction")
+    with fcol[1]:
+        sel_sector = st.selectbox("Sector", secs, key="top_sector", label_visibility="collapsed")
     if direction == "Rising":
         pool = [r for r in ranked if (r["m"].get("r20") or 0) > 0]
     elif direction == "Falling":
         pool = [r for r in ranked if (r["m"].get("r20") or 0) < 0]
     else:
         pool = ranked
+    if sel_sector != "All sectors":
+        pool = [r for r in pool if r["sector"] == sel_sector]
     top = pool[:20]
     for r in top:      # company name + reason only for the 20 actually shown (cheap, cached)
         if "name" not in r:
@@ -2914,13 +2941,14 @@ def render_top_stocks():
             r["why"] = _why_explore(r["m"], r["trend"])
 
     if not top:
-        st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 no "
-                   f"{direction.lower()} names cleared the bar today.")
+        st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 nothing matched "
+                   "those filters today.")
         return
 
     dtxt = {"Rising": "rising", "Falling": "falling", "Both": "moving"}[direction]
+    sfx = "" if sel_sector == "All sectors" else f" in {sel_sector}"
     st.caption(f"As of {today:%B %-d, %Y} \u00b7 scanned {scanned} names \u00b7 showing the top "
-               f"{len(top)} {dtxt} by Focus Priority.")
+               f"{len(top)} {dtxt}{sfx} by Focus Priority.")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
                 unsafe_allow_html=True)
 
@@ -2973,6 +3001,194 @@ def render_top_stocks():
                "quality, with a penalty for one-day spikes. It's a starting point for research, not "
                "a signal to trade \u2014 open any name to dig into the fundamentals and decide for "
                "yourself.")
+
+
+
+# ===========================================================================
+# SECTOR MAP + INDUSTRY BENCHMARKS
+# One company-screener call (cached ~half a day) yields sector, industry, and
+# market cap for the whole US large/mid-cap universe. That single map powers two
+# things: the per-tab SECTOR filters, and the peer groups behind the industry
+# benchmark on each stock page (automated comparable-company analysis — peers
+# picked by industry + similar size, compared on the median with a 25th-75th
+# percentile range).
+# ===========================================================================
+
+@st.cache_data(ttl=43200, show_spinner=False)   # ~12h
+def get_universe_map():
+    """{SYMBOL: {sector, industry, market_cap, name}} for US names above ~$2B,
+    from one screener call. Empty dict on failure, so dependent features quietly
+    no-op rather than break."""
+    rows = _fmp_statement("company-screener?country=US&isEtf=false&isFund=false"
+                          "&isActivelyTrading=true&marketCapMoreThan=2000000000&limit=3000")
+    out = {}
+    for r in rows or []:
+        sym = (r.get("symbol") or "").upper()
+        if not sym:
+            continue
+        out[sym] = {"sector": (r.get("sector") or "").strip(),
+                    "industry": (r.get("industry") or "").strip(),
+                    "market_cap": to_float(r.get("marketCap")),
+                    "name": r.get("companyName") or sym}
+    return out
+
+
+def sector_options(symbols):
+    """Sorted list of sectors present among the given symbols, for a filter."""
+    umap = get_universe_map()
+    secs = {umap.get(s.upper(), {}).get("sector", "") for s in symbols}
+    return sorted(x for x in secs if x)
+
+
+def _peer_snapshot(sym):
+    """One ratios-ttm call -> the comparison metrics for a peer, on the same
+    scale the rest of the app uses (margins/ROE as percentages)."""
+    rt = _fmp_first(f"ratios-ttm?symbol={sym.upper()}")
+
+    def as_pct(x):
+        f = to_float(x)
+        return f * 100 if f is not None else None
+
+    return {
+        "pe": to_float(pick(rt, "priceToEarningsRatioTTM")),
+        "ev_ebitda": to_float(pick(rt, "enterpriseValueMultipleTTM", "evToEBITDATTM")),
+        "ps": to_float(pick(rt, "priceToSalesRatioTTM")),
+        "net_margin": as_pct(pick(rt, "netProfitMarginTTM", "bottomLineProfitMarginTTM")),
+        "gross_margin": as_pct(pick(rt, "grossProfitMarginTTM")),
+        "roe": as_pct(pick(rt, "returnOnEquityTTM")),
+    }
+
+
+def _pctile(xs_sorted, q):
+    if not xs_sorted:
+        return None
+    if len(xs_sorted) == 1:
+        return xs_sorted[0]
+    pos = (q / 100.0) * (len(xs_sorted) - 1)
+    lo = int(pos)
+    frac = pos - lo
+    if lo + 1 < len(xs_sorted):
+        return xs_sorted[lo] + frac * (xs_sorted[lo + 1] - xs_sorted[lo])
+    return xs_sorted[lo]
+
+
+# (key, label, unit, higher_is_stronger). Valuation multiples use "x"; margins/ROE "%".
+BENCH_METRICS = [
+    ("pe", "P/E (TTM)", "x", False),
+    ("ev_ebitda", "EV / EBITDA", "x", False),
+    ("ps", "P / Sales", "x", False),
+    ("net_margin", "Net margin", "%", True),
+    ("gross_margin", "Gross margin", "%", True),
+    ("roe", "ROE", "%", True),
+]
+
+
+@st.cache_data(ttl=43200, show_spinner=False)   # ~12h per stock
+def get_industry_benchmark(symbol, max_peers=10):
+    """Automated comps: peers = same-industry names of similar market cap (fall
+    back to sector if an industry is too thin), compared on the median + 25th-75th
+    percentile range. Returns None if we can't assemble a usable peer set."""
+    umap = get_universe_map()
+    sym = symbol.upper()
+    me = umap.get(sym) or {}
+    industry, sector, cap = me.get("industry", ""), me.get("sector", ""), me.get("market_cap")
+    if not (industry or sector):          # not in the screener map -> try the profile
+        prof = get_company_profile(sym)
+        sector = sector or (prof.get("sector") or "")
+        industry = industry or (prof.get("industry") or "")
+        cap = cap or prof.get("market_cap")
+
+    def band(cands):
+        if not cap:
+            return cands
+        lo, hi = cap * 0.2, cap * 5.0
+        b = [s for s in cands
+             if umap[s].get("market_cap") and lo <= umap[s]["market_cap"] <= hi]
+        return b if len(b) >= 5 else cands   # keep the size band only if it leaves enough
+
+    grouping = "industry"
+    peers = band([s for s, d in umap.items()
+                  if s != sym and industry and d.get("industry") == industry])
+    if len(peers) < 5 and sector:
+        grouping = "sector" if len(peers) < 2 else "industry+sector"
+        speers = band([s for s, d in umap.items()
+                       if s != sym and d.get("sector") == sector])
+        peers = list(dict.fromkeys(peers + speers))
+    if not peers:
+        return None
+    if cap:                               # nearest in size first, then cap the count
+        peers.sort(key=lambda s: abs((umap[s].get("market_cap") or cap) - cap))
+    peers = peers[:max_peers]
+
+    tgt = _peer_snapshot(sym)
+    snaps = [_peer_snapshot(p) for p in peers]
+    rows = []
+    for key, label, unit, higher in BENCH_METRICS:
+        pos_only = (unit == "x")          # drop negative/zero multiples (loss-makers)
+        xs = sorted(v for v in (s.get(key) for s in snaps)
+                    if v is not None and (v > 0 if pos_only else True))
+        med = _median(xs, positive_only=False)
+        if med is None or len(xs) < 3:    # need a few real data points for a median
+            continue
+        rows.append({"key": key, "label": label, "unit": unit, "higher": higher,
+                     "target": tgt.get(key), "median": med,
+                     "p25": _pctile(xs, 25), "p75": _pctile(xs, 75), "n": len(xs)})
+    if not rows:
+        return None
+    return {"industry": industry, "sector": sector, "grouping": grouping,
+            "n_peers": len(peers), "rows": rows}
+
+
+def render_industry_benchmark(symbol):
+    b = get_industry_benchmark(symbol)
+    if not b:
+        st.caption("Not enough same-industry peers of similar size to build a benchmark for this one.")
+        return
+    grp = b["industry"] if (b["grouping"] != "sector" and b["industry"]) else b["sector"]
+    _subgroup("Versus Industry Peers")
+    st.caption(f"Where {symbol.upper()} sits against **{b['n_peers']} {grp or 'sector'} peers** of "
+               "similar size — peer median, with the 25th\u201375th percentile range. Context for "
+               "research, not a verdict: peers share an industry but not always a business model, and "
+               "a whole sector can run rich or cheap at once.")
+    for row in b["rows"]:
+        unit = row["unit"]
+
+        def fmt(v):
+            if v is None:
+                return "\u2014"
+            return f"{v:,.1f}\u00d7" if unit == "x" else f"{v:,.1f}%"
+
+        tgt, p25, p75 = row["target"], row["p25"], row["p75"]
+        pos, pcol = "", MUTED
+        if tgt is not None and p25 is not None and p75 is not None:
+            if tgt > p75:
+                pos = "above peers"
+                pcol = POS if row["higher"] else NEG
+            elif tgt < p25:
+                pos = "below peers"
+                pcol = NEG if row["higher"] else POS
+            else:
+                pos = "in the pack"
+        c = st.columns([1.7, 1.15, 2.15])
+        with c[0]:
+            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
+                        f"text-transform:uppercase'>{row['label']}</div>"
+                        f"<div style='font-weight:600;font-size:1.05rem'>{fmt(tgt)}</div>",
+                        unsafe_allow_html=True)
+        with c[1]:
+            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
+                        f"text-transform:uppercase'>Peer median</div>"
+                        f"<div style='font-size:1.02rem'>{fmt(row['median'])}</div>",
+                        unsafe_allow_html=True)
+        with c[2]:
+            postxt = (f"<span style='color:{pcol};font-weight:600'> \u00b7 {pos}</span>"
+                      if pos else "")
+            st.markdown(f"<div style='font-size:.6rem;letter-spacing:.09em;color:{MUTED};"
+                        f"text-transform:uppercase'>Peer range ({row['n']})</div>"
+                        f"<div style='color:{MUTED};font-size:.92rem'>{fmt(p25)} \u2013 {fmt(p75)}"
+                        f"{postxt}</div>", unsafe_allow_html=True)
+        st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.35rem 0'>",
+                    unsafe_allow_html=True)
 
 
 
