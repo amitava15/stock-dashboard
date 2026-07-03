@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.15.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3824,6 +3824,280 @@ def _render_research_read(name, F):
         unsafe_allow_html=True)
 
 
+# ===========================================================================
+# CONTEXT  —  news + filing highlights (the "what changed, and does it matter?"
+# layer). Opt-in. Deterministic filing discovery from SEC direct; synthesis +
+# citations from a pluggable provider (Perplexity or Gemini). Claude stays for
+# the deeper analysis tab. Cached per ticker per day; a free copy-prompt route
+# needs no API key. Verdict-free by construction.
+# ===========================================================================
+
+CONTEXT_DOMAINS = ["sec.gov", "businesswire.com", "globenewswire.com",
+                   "prnewswire.com", "reuters.com", "apnews.com"]
+CONTEXT_DAILY_SOFT_LIMIT = 40   # per-session guard against runaway spend
+
+
+def _sec_ua():
+    # SEC requires a descriptive User-Agent with contact info or it returns 403.
+    return st.secrets.get("SEC_USER_AGENT", "tava-stock-dashboard research contact@example.com")
+
+
+def _context_provider():
+    forced = (st.secrets.get("CONTEXT_PROVIDER") or "").lower().strip()
+    if forced in ("perplexity", "gemini"):
+        return forced
+    if st.secrets.get("PERPLEXITY_API_KEY"):
+        return "perplexity"
+    if st.secrets.get("GEMINI_API_KEY"):
+        return "gemini"
+    return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)   # SEC guidance: cache submissions 6-12h
+def get_recent_filings(cik):
+    """Latest 8-K / 10-Q / 10-K from SEC direct (no key; needs a User-Agent)."""
+    if not cik:
+        return []
+    try:
+        cik_int = str(int(cik))
+    except (TypeError, ValueError):
+        return []
+    try:
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik_int.zfill(10)}.json",
+                         headers={"User-Agent": _sec_ua()}, timeout=15)
+        r.raise_for_status()
+        recent = ((r.json().get("filings") or {}).get("recent") or {})
+    except Exception:  # noqa: BLE001
+        return []
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    accs = recent.get("accessionNumber") or []
+    docs = recent.get("primaryDocument") or []
+    descs = recent.get("primaryDocDescription") or []
+    out, seen = [], set()
+    for i, form in enumerate(forms):                 # arrays are newest-first
+        if form in ("10-K", "10-Q", "8-K") and form not in seen:
+            acc = (accs[i] if i < len(accs) else "").replace("-", "")
+            doc = docs[i] if i < len(docs) else ""
+            url = (f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc}/{doc}"
+                   if acc and doc else
+                   f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_int}&type={form}")
+            out.append({"form": form, "date": dates[i] if i < len(dates) else "",
+                        "url": url, "desc": descs[i] if i < len(descs) else ""})
+            seen.add(form)
+        if len(seen) >= 3:
+            break
+    return out
+
+
+def _build_context_prompt(symbol, name, filings):
+    filing_lines = "\n".join(f"- {f['form']} filed {f['date']}: {f['url']}" for f in filings) \
+        or "None retrieved."
+    return (
+        f"You are writing the \"Context\" section for a personal stock research dashboard. Use web "
+        f"search to identify recent, MATERIAL developments for {symbol} ({name}). Cite sources. Do "
+        "NOT give buy/sell advice.\n\n"
+        f"Most recent SEC filings (summarize the newest 8-K / 10-Q / 10-K only if material):\n"
+        f"{filing_lines}\n\n"
+        "Priority order: (1) official company announcements / investor-relations, (2) SEC filings "
+        "(8-K, 10-Q, 10-K), (3) earnings releases & guidance, (4) reputable news, (5) sector/policy "
+        "news only if directly relevant.\n\n"
+        "Return ONLY a JSON object, no markdown fences, with exactly this shape:\n"
+        '{"latest_catalyst":"one-sentence summary of what changed",'
+        '"most_important_event":{"title":"...","source":"...","date":"...","url":"..."},'
+        '"materiality":"High|Medium|Low","why_it_matters":"plain-English",'
+        '"what_to_verify_next":"a specific next check","confidence":"High|Medium|Low",'
+        '"warning":"any caveat, or empty string"}\n\n'
+        "Rules: say \"may explain\"/\"appears related to\", not \"caused\", unless a source says so. "
+        "Distinguish official filings/press releases from media commentary. If no clear catalyst, say "
+        "so in latest_catalyst. If the move looks sector- or policy-driven, label it. Never say buy, "
+        "sell, or hold.")
+
+
+def _context_via_perplexity(prompt):
+    key = st.secrets.get("PERPLEXITY_API_KEY")
+    body = {"model": st.secrets.get("PERPLEXITY_MODEL", "sonar"),
+            "messages": [{"role": "user", "content": prompt}],
+            "search_recency_filter": "month", "temperature": 0.2,
+            "search_domain_filter": CONTEXT_DOMAINS[:10]}
+    r = requests.post("https://api.perplexity.ai/chat/completions",
+                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                      json=body, timeout=60)
+    r.raise_for_status()
+    d = r.json()
+    text = (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    cites = d.get("citations") or []
+    if not cites and d.get("search_results"):
+        cites = [s.get("url") for s in d["search_results"] if s.get("url")]
+    return text, cites
+
+
+def _context_via_gemini(prompt):
+    key = st.secrets.get("GEMINI_API_KEY")
+    model = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
+    r = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=60)
+    r.raise_for_status()
+    cand = (r.json().get("candidates") or [{}])[0]
+    text = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []))
+    cites = [(c.get("web") or {}).get("uri")
+             for c in ((cand.get("groundingMetadata") or {}).get("groundingChunks") or [])
+             if (c.get("web") or {}).get("uri")]
+    return text, cites
+
+
+def _parse_context_json(text):
+    import json as _json
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t[4:] if t[:4].lower() == "json" else t
+    a, b = t.find("{"), t.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            return _json.loads(t[a:b + 1])
+        except Exception:  # noqa: BLE001
+            pass
+    return {"latest_catalyst": (text or "")[:600].strip(), "_unparsed": True}
+
+
+@st.cache_data(ttl=43200, show_spinner=False)   # cached per (symbol, provider, day)
+def generate_context(symbol, name, provider, day):
+    filings = []
+    try:
+        filings = get_recent_filings(get_earnings_context(symbol).get("cik"))
+    except Exception:  # noqa: BLE001
+        filings = []
+    prompt = _build_context_prompt(symbol, name, filings)
+    try:
+        if provider == "perplexity":
+            text, cites = _context_via_perplexity(prompt)
+        elif provider == "gemini":
+            text, cites = _context_via_gemini(prompt)
+        else:
+            return {"error": "No context provider configured.", "filings": filings}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200], "filings": filings}
+    res = _parse_context_json(text)
+    res["citations"] = [c for c in (cites or []) if c][:8]
+    res["filings"] = filings
+    return res
+
+
+def _ctx_tone(level):
+    return {"high": "risk", "medium": "caution", "low": "neutral"}.get((level or "").lower(), "neutral")
+
+
+def _render_context_card(res, symbol):
+    if res.get("error"):
+        st.warning(f"Couldn't fetch live context ({res['error']}). The copy-prompt route still works, "
+                   "and any filings found are linked below.")
+    else:
+        cat = res.get("latest_catalyst") or "No clear recent catalyst was found."
+        st.markdown(
+            f"<div style='border:1px solid {LINE};border-left:3px solid {INK};background:#F7F5EE;"
+            f"border-radius:10px;padding:.9rem 1.1rem;margin:.3rem 0 .5rem;max-width:52rem'>"
+            f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
+            f"margin-bottom:.35rem'>What changed</div>"
+            f"<div style='font-size:1.02rem;line-height:1.5;color:{INK};font-weight:600'>{cat}</div>",
+            unsafe_allow_html=True)
+        ev = res.get("most_important_event") or {}
+        if ev.get("title"):
+            link = (f" \u2014 <a href='{ev.get('url')}' target='_blank'>{ev.get('source') or 'source'}</a>"
+                    if ev.get("url") else "")
+            st.markdown(
+                f"<div style='font-size:.9rem;color:{MUTED};margin-top:.4rem'>Most important: "
+                f"{ev.get('title')}{(' \u00b7 ' + ev.get('date')) if ev.get('date') else ''}{link}</div>"
+                "</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        c = st.columns(2)
+        metric_tile(c[0], "Materiality", res.get("materiality") or "\u2014", "materiality",
+                    status=res.get("materiality"), status_tone=_ctx_tone(res.get("materiality")))
+        with c[1]:
+            st.metric("Confidence", res.get("confidence") or "\u2014")
+        if res.get("why_it_matters"):
+            _guide_para("<b>Why it matters:</b> " + res["why_it_matters"])
+        if res.get("what_to_verify_next"):
+            _verify_line(res["what_to_verify_next"])
+        if res.get("warning"):
+            st.caption("Note: " + res["warning"])
+
+    cites = res.get("citations") or []
+    if cites:
+        links = " \u00b7 ".join(f"<a href='{u}' target='_blank'>{_short_url(u)}</a>" for u in cites)
+        st.markdown(f"<div style='font-size:.8rem;color:{MUTED};margin:.3rem 0'>"
+                    f"<b>Sources:</b> {links}</div>", unsafe_allow_html=True)
+    filings = res.get("filings") or []
+    if filings:
+        fl = " \u00b7 ".join(f"<a href='{f['url']}' target='_blank'>{f['form']} ({f['date']})</a>"
+                             for f in filings)
+        st.markdown(f"<div style='font-size:.8rem;color:{MUTED};margin:.1rem 0 .3rem'>"
+                    f"<b>Latest filings:</b> {fl}</div>", unsafe_allow_html=True)
+    st.caption("Context is aggregated from cited sources \u2014 not a recommendation.")
+
+
+def _short_url(u):
+    try:
+        return u.split("/")[2].replace("www.", "")
+    except Exception:  # noqa: BLE001
+        return "source"
+
+
+def _context_prompt_body(symbol, name):
+    try:
+        filings = get_recent_filings(get_earnings_context(symbol).get("cik"))
+    except Exception:  # noqa: BLE001
+        filings = []
+    st.caption("Paste this into Perplexity, Gemini, ChatGPT, or Claude to get the cited briefing for "
+               "free \u2014 it already includes the latest SEC filing links.")
+    st.code(_build_context_prompt(symbol, name, filings), language="markdown")
+
+
+if hasattr(st, "dialog"):
+    try:
+        _context_prompt_dialog = st.dialog("Context prompt \u2014 paste into any AI",
+                                           width="large")(_context_prompt_body)
+    except TypeError:
+        _context_prompt_dialog = st.dialog("Context prompt")(_context_prompt_body)
+else:
+    _context_prompt_dialog = _context_prompt_body
+
+
+def render_context(symbol, name):
+    import datetime as _dt
+    provider = _context_provider()
+    _subgroup("Context \u2014 recent news & filings")
+    cc = st.columns([1.7, 1.7, 2.6])
+    with cc[0]:
+        gen = st.button("Generate latest context", key=f"ctx_{symbol}", use_container_width=True,
+                        disabled=(provider is None))
+    with cc[1]:
+        if st.button("Copy research prompt", key=f"ctxp_{symbol}", use_container_width=True):
+            _context_prompt_dialog(symbol, name)
+    if provider is None:
+        st.caption("Add a `PERPLEXITY_API_KEY` or `GEMINI_API_KEY` in Streamlit secrets to enable the "
+                   "in-app briefing \u2014 or use **Copy research prompt** (free, works in any AI).")
+        return
+    if not gen:
+        cap = ("console.perplexity.ai" if provider == "perplexity"
+               else "your Google Cloud billing budget")
+        st.caption(f"On demand, **{provider}** pulls recent news + the latest SEC filings with "
+                   f"citations. Cached per stock per day; set a monthly spend cap in {cap}.")
+        return
+    if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
+        st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
+                   "Reload to reset, or use the free copy-prompt route.")
+        return
+    st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+    with st.spinner("Reading recent news and filings\u2026"):
+        res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
+    _render_context_card(res, symbol)
+
+
+
 def render_guided(symbol, quote, profile, metrics):
     sym = symbol.upper()
     name = profile.get("name") or sym
@@ -3958,6 +4232,7 @@ def render_guided(symbol, quote, profile, metrics):
             f"whether that last surprise came from durable demand or a one-off \u2014 and whether "
             f"estimates for the next report ({nxt.get('date')}) are drifting up or down heading in. "
             "Rising estimates into a print is a stronger signal than the beat itself.")
+    render_context(sym, name)
     _handoff("A good quarter only matters if the business behind it is actually getting stronger \u2014 "
              "so next, the trajectory.")
 
