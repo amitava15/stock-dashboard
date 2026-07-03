@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.12.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3601,6 +3601,15 @@ def _handoff(text):
         f"{text}</div>", unsafe_allow_html=True)
 
 
+def _join_clauses(items):
+    items = [x for x in items if x]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
 def render_guided(symbol, quote, profile, metrics):
     sym = symbol.upper()
     name = profile.get("name") or sym
@@ -3632,6 +3641,14 @@ def render_guided(symbol, quote, profile, metrics):
     tech = get_technicals(sym)
     cur, gro, hist = val["current"], val["growth"], val["history"]
 
+    # Company-condition flags that make the guidance adaptive (the fix the MRNA
+    # review called for): loss-making and shrinking businesses read differently.
+    _nm0 = to_float(metrics.get("net_margin_pct"))
+    _pe0 = to_float(cur.get("pe"))
+    _rev0 = to_float(gro.get("revenue"))
+    loss_making = (_nm0 is not None and _nm0 < 0) or (_pe0 is not None and _pe0 < 0)
+    shrinking = _rev0 is not None and _rev0 < 0
+
     # ---- how to read this stock ----
     st.markdown(
         f"<div style='background:rgba(122,121,112,.06);border:1px solid {LINE};border-radius:10px;"
@@ -3650,25 +3667,37 @@ def render_guided(symbol, quote, profile, metrics):
     last, nxt = ea.get("last") or {}, ea.get("next") or {}
     c = st.columns(3)
     ea_a, ea_e = to_float(last.get("eps_actual")), to_float(last.get("eps_est"))
-    beat = ((ea_a / ea_e - 1) * 100) if (ea_a is not None and ea_e) else None
-    beat_txt = (f"{money(ea_a)} vs {money(ea_e)} est"
-                + (f" \u00b7 {'beat' if beat >= 0 else 'missed'} {abs(beat):.0f}%" if beat is not None else "")
-                ) if ea_a is not None else "n/a"
+    # Surprise as a share of the ABSOLUTE estimate, so the sign stays correct when
+    # EPS is negative: a smaller-than-expected loss is a BEAT, not a miss.
+    surprise = ((ea_a - ea_e) / abs(ea_e) * 100) if (ea_a is not None and ea_e not in (None, 0)) else None
+    is_beat = (ea_a > ea_e) if (ea_a is not None and ea_e is not None) else None
+    loss_q = ea_a is not None and ea_a < 0
+    beat_txt = "\u2014"
+    if ea_a is not None:
+        beat_txt = f"{money(ea_a)} vs {money(ea_e)} est"
+        if surprise is not None:
+            beat_txt += f" \u00b7 {'beat' if is_beat else 'missed'} by {abs(surprise):.0f}%"
     with c[0]:
-        st.metric("Last EPS (actual vs est.)", beat_txt if ea_a is not None else "\u2014")
+        st.metric("Last EPS (actual vs est.)", beat_txt)
     with c[1]:
         st.metric("Next earnings", str(nxt.get("date") or "\u2014"))
     with c[2]:
         st.metric("Days away", str(nxt.get("days")) if nxt.get("days") is not None else "\u2014")
-    if ea_a is not None and beat is not None:
-        verb = "beat" if beat >= 0 else "came in under"
+    if ea_a is not None and surprise is not None and loss_q:
         _guide_para(
-            f"In its most recent quarter, {name} reported earnings of {money(ea_a)} a share against "
-            f"the {money(ea_e)} analysts expected \u2014 it {verb} the estimate by about "
-            f"{abs(beat):.0f}%. Earnings are where a story is confirmed or broken, so a beat says the "
-            "business is running ahead of what the market had modeled; a miss says the opposite. One "
-            "quarter isn't a trend, though \u2014 a single beat can come from a one-off, and a single "
-            "miss from timing.")
+            f"In its most recent quarter, {name} reported a loss of {money(abs(ea_a))} a share against "
+            f"an expected {money(abs(ea_e))} loss \u2014 a {'smaller' if is_beat else 'bigger'} loss "
+            f"than analysts modeled, about {abs(surprise):.0f}% {'better' if is_beat else 'worse'}. For "
+            "a company still losing money, a 'beat' means the loss was less bad than feared \u2014 a "
+            "genuine positive surprise, but not the same as turning profitable. What matters is the "
+            "<i>direction</i>: is the loss shrinking quarter over quarter?")
+    elif ea_a is not None and surprise is not None:
+        _guide_para(
+            f"In its most recent quarter, {name} reported earnings of {money(ea_a)} a share against the "
+            f"{money(ea_e)} analysts expected \u2014 it {'beat' if is_beat else 'came in under'} the "
+            f"estimate by about {abs(surprise):.0f}%. Earnings are where a story is confirmed or broken, "
+            "so a beat says the business is running ahead of what the market had modeled; a miss says "
+            "the opposite. One quarter isn't a trend, though \u2014 a single beat can come from a one-off.")
     else:
         _guide_para(
             f"There isn't clean actual-vs-estimate data for {name}'s last quarter on the current data "
@@ -3695,27 +3724,45 @@ def render_guided(symbol, quote, profile, metrics):
     _s, _t = _roe_signal(roe)
     metric_tile(c[2], "Return on Equity", pct(roe), "roe", status=_s, status_tone=_t)
     bits = []
-    if rev_g is not None:
-        bits.append(f"revenue is {'growing' if rev_g > 0 else 'shrinking'} about {abs(rev_g):.0f}% "
-                    "year over year")
-    if nm is not None:
-        bits.append(f"it keeps roughly {nm:.0f}\u00a2 of every sales dollar as profit (net margin)")
-    if roe is not None:
-        bits.append(f"and earns about {roe:.0f}% on shareholders' equity")
-    if bits:
+    if loss_making or shrinking:
+        sent = []
+        if rev_g is not None:
+            sent.append(f"revenue is {'shrinking' if rev_g < 0 else 'growing'} about {abs(rev_g):.0f}% "
+                        "year over year")
+        if nm is not None and nm < 0:
+            sent.append(f"the company is losing roughly ${abs(nm) / 100:.2f} for every $1 of sales "
+                        f"(net margin {nm:.0f}%) \u2014 a clear profitability warning")
+        elif nm is not None:
+            sent.append(f"net margin sits around {nm:.0f}%")
+        lead = _join_clauses(sent)
+        lead = (lead[0].upper() + lead[1:] + ". ") if lead else ""
         _guide_para(
-            (name + " is " + ", ".join(bits) + ". ").replace(" is revenue", " has revenue that")
-            + "High and rising margins with strong returns usually mean real pricing power and a "
-            "business getting more efficient. The catch: if the company is cyclical, today's fat "
-            "margins can be the <i>top</i> of the cycle, not the new normal \u2014 which flatters "
-            "every profitability number at once.")
+            lead
+            + f"Numbers like these mean {name} is better read as a <b>turnaround or reset story</b> "
+            "than a steady quality-growth business right now. The question isn't 'how good are the "
+            "margins' \u2014 it's 'is the business rebuilding': is revenue stabilizing, and is the loss "
+            "getting smaller quarter over quarter?")
+        _verify_line(
+            "whether the loss is <i>shrinking</i> and revenue is <i>stabilizing</i> over the last few "
+            "quarters. A turnaround only works if the trend is bending the right way \u2014 pull up the "
+            "multi-year and quarterly trajectory and check the direction, not just the latest level.")
     else:
-        _guide_para("Profitability data is thin for this one on the current tier \u2014 check the "
-                    "Business tab's multi-year trajectory to see the direction.")
-    _verify_line(
-        "whether margins are still <i>rising</i> or just <i>high</i>. Pull up the multi-year "
-        "trajectory: steadily climbing margins are quality; a sharp spike after a slump is often "
-        "cyclical, and cyclical peaks don't last.")
+        if rev_g is not None:
+            bits.append(f"growing revenue about {abs(rev_g):.0f}% a year")
+        if nm is not None:
+            bits.append(f"keeping about {nm:.0f}\u00a2 of every sales dollar as profit")
+        if roe is not None:
+            bits.append(f"earning roughly {roe:.0f}% on shareholders' equity")
+        _guide_para(
+            (f"{name} is " + _join_clauses(bits) + ". " if bits else "")
+            + "High, rising margins with strong returns usually point to real pricing power and a "
+            "business getting more efficient. The main caveat is durability: <i>if</i> this is a "
+            "cyclical business or an unusually strong stretch, today's margins can be a peak rather "
+            "than the norm \u2014 which flatters every profitability number at once.")
+        _verify_line(
+            "whether margins are still <i>rising</i> or merely <i>high</i>. Pull up the multi-year "
+            "trajectory: steadily climbing margins are a quality sign; a sharp spike after a slump "
+            "often doesn't hold.")
     _handoff("Profit on paper isn't the same as money in the bank \u2014 so next, does it turn into "
              "cash?")
 
@@ -3724,28 +3771,47 @@ def render_guided(symbol, quote, profile, metrics):
     fcf_y = to_float(cur.get("fcf_yield"))
     fcf_g = to_float(gro.get("fcf"))
     c = st.columns(2)
-    _s, _t = _sign_signal(fcf_y, pos="healthy", neg="negative")
+    if fcf_y is not None and fcf_y < 0:
+        _s, _t = "Negative \u00b7 cash burn", "risk"
+    elif fcf_y is not None and fcf_y >= 3:
+        _s, _t = "Healthy", "good"
+    else:
+        _s, _t = _sign_signal(fcf_y, pos="healthy", neg="cash burn")
     metric_tile(c[0], "FCF Yield", pct(fcf_y), "fcf_yield", status=_s, status_tone=_t)
     _s, _t = _sign_signal(fcf_g)
     metric_tile(c[1], "FCF Growth (YoY)", pct(fcf_g), "fcf_growth", status=_s, status_tone=_t)
-    if fcf_y is not None or fcf_g is not None:
+    if fcf_y is not None and fcf_y < 0:
+        _guide_para(
+            "Free cash flow is what's left after a company funds its operations and investments \u2014 "
+            "harder to fake than accounting profit. Here it's <b>negative</b>: a free-cash-flow yield "
+            f"of about {fcf_y:.1f}% means the business is <b>burning cash</b> relative to its value. "
+            + (f"Cash flow did improve about {abs(fcf_g):.0f}% year over year, so the burn may be "
+               "easing \u2014 but it's <i>still negative</i>, so the company isn't yet funding itself. "
+               if (fcf_g is not None and fcf_g > 0) else "")
+            + "For a cash-burning business the key question isn't yield, it's <b>runway</b>: how much "
+            "cash is on hand, and how long does it last at this burn rate?")
+        _verify_line(
+            "how much cash and short-term investments the company holds, and how many quarters that "
+            "funds at the current burn rate. A shrinking loss is only reassuring if the runway is long "
+            "enough to reach profitability.")
+    elif fcf_y is not None or fcf_g is not None:
         _guide_para(
             "Free cash flow is what's left after the company pays to keep the lights on and invest in "
             "growth \u2014 it's harder to fake than accounting profit. "
-            + (f"Here the free-cash-flow yield is about {fcf_y:.1f}%, "
-               "meaning that's what the business throws off in cash relative to its price. " if fcf_y is not None else "")
-            + (f"Cash flow is {'up' if (fcf_g or 0) > 0 else 'down'} about {abs(fcf_g):.0f}% "
-               "year over year. " if fcf_g is not None else "")
+            + (f"Here the free-cash-flow yield is about {fcf_y:.1f}%, what the business throws off in "
+               "cash relative to its price. " if fcf_y is not None else "")
+            + (f"Cash flow is {'up' if (fcf_g or 0) > 0 else 'down'} about {abs(fcf_g):.0f}% year over "
+               "year. " if fcf_g is not None else "")
             + "Profit that doesn't become cash is a yellow flag; cash that grows alongside profit is "
             "the real thing. In capital-heavy businesses, watch how much gets eaten by capital "
             "spending before it ever reaches free cash flow.")
+        _verify_line(
+            "whether free cash flow tracks reported profit over the last few years. If profit rises but "
+            "cash doesn't, ask where the money is going \u2014 usually capital spending or working "
+            "capital \u2014 and whether that's temporary or the nature of the business.")
     else:
         _guide_para("Cash-flow figures aren't available on the current tier for this one \u2014 the "
                     "Business tab's Cash Generation charts show the multi-year shape.")
-    _verify_line(
-        "whether free cash flow tracks reported profit over the last few years. If profit rises but "
-        "cash doesn't, ask where the money is going \u2014 usually capital spending or working "
-        "capital \u2014 and whether that's temporary or the nature of the business.")
     _handoff("A strong, cash-generating business can still be a poor investment if you overpay \u2014 "
              "so next, the price.")
 
@@ -3753,13 +3819,9 @@ def render_guided(symbol, quote, profile, metrics):
     section("Is the price fair?", "step 4 \u00b7 valuation")
     pe = to_float(cur.get("pe"))
     fwd = to_float(cur.get("forward_pe"))
+    ps = to_float(cur.get("ps"))
     pe_med = to_float((hist.get("pe") or {}).get("median"))
-    c = st.columns(3)
-    _s, _t = _valuation_signal(pe, "pe")
-    metric_tile(c[0], "P/E (TTM)", num(pe), "pe", status=_s, status_tone=_t)
-    metric_tile(c[1], "Forward P/E", num(fwd), "forward_pe")
-    with c[2]:
-        st.metric("Own 5-yr median P/E", num(pe_med) if pe_med is not None else "\u2014")
+    unprofitable = loss_making or (pe is not None and pe <= 0)
     bench = get_industry_benchmark(sym)
     peer_pe = None
     if bench:
@@ -3767,36 +3829,68 @@ def render_guided(symbol, quote, profile, metrics):
             if row["key"] == "pe":
                 peer_pe = row
                 break
-    # facts -> both readings -> what to verify  (the locked template)
-    facts = []
-    if pe is not None and pe_med is not None:
-        rel = "above" if pe > pe_med else "below"
-        facts.append(f"{sym}'s P/E of {num(pe)} sits {rel} its own 5-year median of {num(pe_med)}")
-    if peer_pe and peer_pe.get("median") is not None and pe is not None:
-        rel = "below" if pe < peer_pe["median"] else "above"
-        facts.append(f"and {rel} its peer median of {num(peer_pe['median'])}\u00d7")
-    if facts:
+
+    if unprofitable:
+        c = st.columns(3)
+        with c[0]:
+            st.metric("P/E (TTM)", "Loss-making")
+        metric_tile(c[1], "Price / Sales", num(ps), "price_sales")
+        with c[2]:
+            st.metric("Forward P/E", num(fwd) if fwd is not None else "N/A")
         _guide_para(
-            " ".join(facts).capitalize() + ". "
-            + ("A stock above its own history but below its peers usually means one of two things: "
-               "either the market expects its earnings to keep climbing (so today's price is cheap "
-               "against <i>tomorrow's</i> profit), or the whole peer group is simply expensive right "
-               "now. "
-               if (pe is not None and pe_med is not None and peer_pe and pe < (peer_pe.get('median') or 0) and pe > pe_med)
-               else "The gap between what a stock trades at, its own history, and its peers is the "
-                    "heart of the valuation question \u2014 a high multiple is only justified if "
-                    "growth is real and durable. ")
-            + (f"The forward P/E of {num(fwd)} \u2014 lower than the trailing {num(pe)} \u2014 tells "
-               "you analysts expect earnings to rise, which is exactly the bet embedded in the price. "
-               if (fwd is not None and pe is not None and fwd < pe) else ""))
+            f"P/E isn't a useful gauge for {name} right now, because it's <b>losing money</b>. A "
+            "negative or missing P/E doesn't mean 'cheap' \u2014 it just means there are no positive "
+            "earnings to price against, so comparing it to a history or a peer median would mislead "
+            "you. For a company like this, valuation leans on other anchors: price-to-sales"
+            + (f" (about {num(ps)}\u00d7 here)" if ps is not None else "")
+            + ", how much cash it holds to fund itself, the revenue trend, and above all <i>when</i> "
+            "analysts expect it to return to profit.")
+        _verify_line(
+            "when analysts expect the company to be profitable again, how much cash it has to bridge "
+            "the gap until then, and whether revenue estimates are stabilizing or still falling. Those "
+            "decide the value here far more than any earnings multiple does today.")
     else:
-        _guide_para("Valuation multiples are incomplete for this one on the current tier \u2014 the "
-                    "Valuation tab shows whatever is available plus the peer benchmark.")
-    _verify_line(
-        "which of those two readings is true \u2014 and that comes down to the estimates. Are FY26/"
-        "FY27 earnings forecasts still <i>rising</i>? If they are, a below-peer multiple on growing "
-        "profit is one story; if they're being cut, the 'cheap on forward earnings' case quietly "
-        "falls apart.")
+        c = st.columns(3)
+        _s, _t = _valuation_signal(pe, "pe")
+        metric_tile(c[0], "P/E (TTM)", num(pe), "pe", status=_s, status_tone=_t)
+        metric_tile(c[1], "Forward P/E", num(fwd), "forward_pe")
+        with c[2]:
+            st.metric("Own 5-yr median P/E", num(pe_med) if pe_med is not None else "\u2014")
+        facts = []
+        if pe is not None and pe_med is not None:
+            facts.append(f"{sym}'s P/E of {num(pe)} sits {'above' if pe > pe_med else 'below'} its own "
+                         f"5-year median of {num(pe_med)}")
+        if peer_pe and peer_pe.get("median") is not None and pe is not None:
+            facts.append(f"and {'below' if pe < peer_pe['median'] else 'above'} its peer median of "
+                         f"{num(peer_pe['median'])}\u00d7")
+        cheap_vs_peers = (peer_pe and pe is not None and pe_med is not None
+                          and pe < (peer_pe.get('median') or 0) and pe > pe_med)
+        if facts:
+            _guide_para(
+                " ".join(facts) + ". "
+                + ("A stock above its own history but below its peers usually means one of two things: "
+                   "either the market expects its earnings to keep climbing (so today's price is cheap "
+                   "against <i>tomorrow's</i> profit), or the whole peer group is simply expensive "
+                   "right now. " if cheap_vs_peers
+                   else "The gap between what a stock trades at, its own history, and its peers is the "
+                        "heart of the valuation question \u2014 a high multiple is only justified if "
+                        "growth is real and durable. ")
+                + (f"The forward P/E of {num(fwd)} \u2014 lower than the trailing {num(pe)} \u2014 tells "
+                   "you analysts expect earnings to rise, which is exactly the bet embedded in the "
+                   "price. " if (fwd is not None and pe is not None and fwd < pe) else ""))
+        else:
+            _guide_para("Valuation multiples are incomplete for this one on the current tier \u2014 the "
+                        "Valuation tab shows whatever is available plus the peer benchmark.")
+        if fwd is not None:
+            _verify_line(
+                "whether earnings estimates are still <i>rising</i>. If FY26/FY27 forecasts are climbing, "
+                "a below-peer multiple on growing profit is one story; if they're being cut, the 'cheap "
+                "on forward earnings' case quietly falls apart.")
+        else:
+            _verify_line(
+                "what the price assumes about future profit. With no forward P/E available here, lean on "
+                "the revenue trend and analyst estimates \u2014 is the market paying for growth that the "
+                "forecasts actually support?")
     _handoff("Price only makes sense against expectations \u2014 so next, what is the market already "
              "counting on?")
 
