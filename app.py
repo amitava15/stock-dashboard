@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.22.1"
+APP_VERSION = "0.23.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3311,6 +3311,39 @@ def _delta_html(v, label):
             f"<div style='color:{color};font-weight:600;font-size:1.02rem'>{v:+.1f}%</div>")
 
 
+def _delta_row_html(m):
+    """Today/5D/20D/90D/Vol as ONE combined flex block, not separate st.columns.
+    Streamlit's columns stack vertically on narrow/mobile screens, which was
+    turning this into five full-width lines; a single flex-wrap block stays
+    grouped together and wraps as a unit if the screen is genuinely too
+    narrow, instead of shattering into one metric per line."""
+    def cell(label, value_html):
+        return (f"<div style='min-width:4rem'><div style='font-size:.62rem;letter-spacing:.09em;"
+                f"color:{MUTED};text-transform:uppercase'>{label}</div>{value_html}</div>")
+
+    def pct_cell(label, v):
+        if v is None:
+            return cell(label, f"<div style='color:{MUTED}'>\u2014</div>")
+        color = POS if v >= 0 else NEG
+        return cell(label, f"<div style='color:{color};font-weight:600;font-size:1.0rem'>{v:+.1f}%</div>")
+
+    vr = m.get("vol_ratio")
+    vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
+    vcol = POS if (vr and vr >= 1.3) else MUTED
+    vol_cell = cell("Vol", f"<div style='color:{vcol};font-weight:600;font-size:1.0rem'>{vtxt}</div>")
+
+    row = (pct_cell("Today", m.get("r1")) + pct_cell("5D", m.get("r5"))
+          + pct_cell("20D", m.get("r20")) + pct_cell("90D", m.get("r90")) + vol_cell)
+    return f"<div style='display:flex;flex-wrap:wrap;gap:1rem;margin:.3rem 0'>{row}</div>"
+
+
+def _focus_badge_html(score):
+    text, color = _focus_label(score)
+    return (f"<div style='margin:.2rem 0 .15rem'><span style='font-size:.6rem;letter-spacing:.09em;"
+            f"color:{MUTED};text-transform:uppercase'>Focus</span>&nbsp; "
+            f"<span style='font-weight:700;font-size:.94rem;color:{color}'>{score} | {text}</span></div>")
+
+
 def render_top_stocks():
     import datetime as _dt
     section("Top Stocks to Explore", "your morning starting point")
@@ -3366,49 +3399,25 @@ def render_top_stocks():
 
     for i, r in enumerate(top, 1):
         m = r["m"]
-        c = st.columns([3.0, 1.0, 1.0, 1.0, 1.0, 0.85, 0.5])
-        with c[0]:
-            _px = r["m"].get("price")
+        namecol, btncol = st.columns([6.2, 0.7])
+        with namecol:
+            _px = m.get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
                     f"${_px:,.2f}</span>") if _px is not None else ""
             st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
-                        f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>",
+                        f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>"
+                        f"{_focus_badge_html(r['score'])}"
+                        f"{_delta_row_html(m)}",
                         unsafe_allow_html=True)
-        with c[1]:
-            st.markdown(_delta_html(m["r1"], "Today"), unsafe_allow_html=True)
-        with c[2]:
-            st.markdown(_delta_html(m["r5"], "5D"), unsafe_allow_html=True)
-        with c[3]:
-            st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
-        with c[4]:
-            st.markdown(_delta_html(m.get("r90"), "90D"), unsafe_allow_html=True)
-        with c[5]:
-            vr = m["vol_ratio"]
-            vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
-            vcol = POS if (vr and vr >= 1.3) else MUTED
-            st.markdown(f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
-                        f"text-transform:uppercase'>Vol</div>"
-                        f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
-                        unsafe_allow_html=True)
-        with c[6]:
+        with btncol:
             st.button("\u2192", key=f"top_{r['symbol']}", use_container_width=True, help=f"View {r['symbol']}",
                       on_click=_view_stock, args=(r["symbol"],))
 
         label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
-        _flbl_text, _flbl_color = _focus_label(r["score"])
-        b = st.columns([5.0, 1.0])
-        with b[0]:
-            st.markdown(
-                f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
-                f"text-transform:uppercase'>{label}</span>"
-                f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
-                unsafe_allow_html=True)
-        with b[1]:
-            st.markdown(
-                f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
-                f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
-                f"<span style='font-weight:700;font-size:1.02rem;color:{_flbl_color}'>"
-                f"{r['score']} | {_flbl_text}</span></div>",
+        st.markdown(
+            f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
+            f"text-transform:uppercase'>{label}</span>"
+            f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
                 unsafe_allow_html=True)
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
                     unsafe_allow_html=True)
@@ -3534,8 +3543,8 @@ def render_tracker():
 
     for i, r in enumerate(ranked, 1):
         m = r["m"]
-        c = st.columns([2.9, 0.9, 0.9, 0.9, 0.9, 0.75, 0.4, 0.4])
-        with c[0]:
+        namecol, viewcol, rmcol = st.columns([5.4, 0.6, 0.6])
+        with namecol:
             _px = m.get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
                     f"${_px:,.2f}</span>") if _px is not None else ""
@@ -3543,47 +3552,23 @@ def render_tracker():
             st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
                         f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>"
                         f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
-                        f"{added or '\u2014'}</div>", unsafe_allow_html=True)
-        with c[1]:
-            st.markdown(_delta_html(m["r1"], "Today"), unsafe_allow_html=True)
-        with c[2]:
-            st.markdown(_delta_html(m["r5"], "5D"), unsafe_allow_html=True)
-        with c[3]:
-            st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
-        with c[4]:
-            st.markdown(_delta_html(m.get("r90"), "90D"), unsafe_allow_html=True)
-        with c[5]:
-            vr = m["vol_ratio"]
-            vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
-            vcol = POS if (vr and vr >= 1.3) else MUTED
-            st.markdown(f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
-                        f"text-transform:uppercase'>Vol</div>"
-                        f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
-                        unsafe_allow_html=True)
-        with c[6]:
+                        f"{added or '\u2014'}</div>"
+                        f"{_focus_badge_html(r['score'])}"
+                        f"{_delta_row_html(m)}", unsafe_allow_html=True)
+        with viewcol:
             st.button("\u2192", key=f"trk_view_{r['symbol']}", use_container_width=True,
                       help=f"View {r['symbol']}", on_click=_view_stock, args=(r["symbol"],))
-        with c[7]:
+        with rmcol:
             if st.button("\u2715", key=f"trk_rm_{r['symbol']}", use_container_width=True,
                         help=f"Remove {r['symbol']} from tracker"):
                 _remove_now(r["symbol"])
 
         label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
-        _flbl_text, _flbl_color = _focus_label(r["score"])
-        b = st.columns([5.0, 1.0])
-        with b[0]:
-            st.markdown(
-                f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
-                f"text-transform:uppercase'>{label}</span>"
-                f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
-                unsafe_allow_html=True)
-        with b[1]:
-            st.markdown(
-                f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
-                f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
-                f"<span style='font-weight:700;font-size:1.02rem;color:{_flbl_color}'>"
-                f"{r['score']} | {_flbl_text}</span></div>",
-                unsafe_allow_html=True)
+        st.markdown(
+            f"<span style='font-size:.64rem;letter-spacing:.1em;font-weight:600;color:{lcolor};"
+            f"text-transform:uppercase'>{label}</span>"
+            f"<span style='color:{MUTED};font-size:.86rem'> \u00b7 {r['why']}</span>",
+            unsafe_allow_html=True)
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
                     unsafe_allow_html=True)
 
