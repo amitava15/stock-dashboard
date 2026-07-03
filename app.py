@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.11.1"
+APP_VERSION = "0.11.2"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -1348,19 +1348,25 @@ def render_valuation_growth(symbol):
     c = st.columns(3)
 
     def hist_tile(col, label, item, help_key):
+        """Historical context should center the stock's own 5-year median.
+
+        The current value is already shown in Current Valuation, so this tile
+        uses the historical median as the main number and puts today's value in
+        the caption only as context.
+        """
         now, med = item.get("now"), item.get("median")
         word = _cmp_word(now, med)
         with col:
-            st.metric(label, num(now), help=EXPLAINERS.get(help_key))
-            if med is not None:
+            st.metric(f"{label} 5-yr median", num(med), help=EXPLAINERS.get(help_key))
+            if now is not None:
                 tail = f" · trading **{word}**" if word else ""
-                st.caption(f"5-yr median **{num(med)}**{tail}")
+                st.caption(f"Now **{num(now)}**{tail}")
             else:
-                st.caption("5-yr median unavailable")
+                st.caption("Current value unavailable")
 
-    hist_tile(c[0], "P/E now", hist["pe"], "pe_vs_median")
-    hist_tile(c[1], "EV/EBITDA now", hist["ev"], "ev_vs_median")
-    hist_tile(c[2], "P/S now", hist["ps"], "ps_vs_median")
+    hist_tile(c[0], "P/E", hist["pe"], "pe_vs_median")
+    hist_tile(c[1], "EV/EBITDA", hist["ev"], "ev_vs_median")
+    hist_tile(c[2], "P/S", hist["ps"], "ps_vs_median")
 
     st.caption(_valuation_read(d))
     render_industry_benchmark(symbol)
@@ -3128,7 +3134,7 @@ def get_industry_benchmark(symbol, max_peers=10):
         xs = sorted(v for v in (s.get(key) for s in snaps)
                     if v is not None and (v > 0 if pos_only else True))
         med = _median(xs, positive_only=False)
-        if med is None or len(xs) < 3:    # need a few real data points for a median
+        if med is None or len(xs) < 5:    # need enough real data points for a reliable peer range
             continue
         rows.append({"key": key, "label": label, "unit": unit, "higher": higher,
                      "target": tgt.get(key), "median": med,
@@ -3183,22 +3189,28 @@ def render_industry_benchmark(symbol):
         for col, row in zip(cols, rows[i:i + 3]):
             unit = row["unit"]
             tgt, p25, p75 = row["target"], row["p25"], row["p75"]
-            pos, pcol = "", MUTED
+
             if tgt is not None and p25 is not None and p75 is not None:
                 if tgt > p75:
-                    pos, pcol = "above peers", (POS if row["higher"] else NEG)
+                    pos, pcol = "above peer range", (POS if row["higher"] else NEG)
                 elif tgt < p25:
-                    pos, pcol = "below peers", (NEG if row["higher"] else POS)
+                    pos, pcol = "below peer range", (NEG if row["higher"] else POS)
                 else:
-                    pos = "in the pack"
+                    pos, pcol = "within peer range", MUTED
+            else:
+                pos, pcol = "company value unavailable", MUTED
+
+            peer_range = f"{_fmt_bench(p25, unit)} – {_fmt_bench(p75, unit)}"
+            postxt = f"<span style='color:{pcol};font-weight:600'>{pos}</span>"
+
             with col:
-                st.metric(row["label"], _fmt_bench(tgt, unit))
-                postxt = (f"<span style='color:{pcol};font-weight:600'> \u00b7 {pos}</span>"
-                          if pos else "")
+                # Main value = peer 25th–75th percentile range. We don't repeat the
+                # company's own value here because it is shown in Current Valuation.
+                st.metric(row["label"], peer_range)
                 st.markdown(
                     f"<div style='color:{MUTED};font-size:.79rem;margin-top:-.7rem;line-height:1.5'>"
-                    f"Peers {_fmt_bench(row['median'], unit)} \u00b7 "
-                    f"{_fmt_bench(p25, unit)}\u2013{_fmt_bench(p75, unit)}{postxt}</div>",
+                    f"Median: <b>{_fmt_bench(row['median'], unit)}</b> · {row['n']} peers<br>"
+                    f"{symbol.upper()} is {postxt}</div>",
                     unsafe_allow_html=True)
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.5rem 0 .7rem'>",
                     unsafe_allow_html=True)
