@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.19.3"
+APP_VERSION = "0.20.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3070,6 +3070,18 @@ _TREND_LABEL = {
 }
 
 
+def _focus_label(score):
+    """Score -> (label, color), so the number itself never has to be read as
+    a verdict \u2014 just a rough sense of how much is going on with a name."""
+    if score >= 60:
+        return "Very High", "#2F6B4F"
+    if score >= 40:
+        return "High", "#3D6B52"
+    if score >= 20:
+        return "Medium", "#B07A2E"
+    return "Low", "#A0A099"
+
+
 def _pctret(a, b):
     return ((a - b) / b * 100.0) if (a is not None and b not in (None, 0)) else None
 
@@ -3087,7 +3099,7 @@ def _scan_metrics(df):
     def ret(n):
         return _pctret(last, closes[-1 - n]) if len(closes) > n else None
 
-    r1, r3, r5, r20 = ret(1), ret(3), ret(5), ret(20)
+    r1, r3, r5, r20, r90 = ret(1), ret(3), ret(5), ret(20), ret(90)
     # Move over the 4 days ending YESTERDAY — i.e. the trend that was in place
     # before today. This is what separates a sustained move (prior move already
     # underway) from a one-day spike (flat before, jumped today).
@@ -3104,7 +3116,7 @@ def _scan_metrics(df):
         if len(vols) >= 21:
             avg20 = sum(vols[-21:-1]) / 20
             vol_ratio = (vols[-1] / avg20) if avg20 else None
-    return dict(price=last, r1=r1, r3=r3, r5=r5, r20=r20, r_prior=r_prior, vs_ma50=vs_ma50,
+    return dict(price=last, r1=r1, r3=r3, r5=r5, r20=r20, r90=r90, r_prior=r_prior, vs_ma50=vs_ma50,
                 dist_high=dist_high, dist_low=dist_low, vol_ratio=vol_ratio)
 
 
@@ -3198,7 +3210,7 @@ def _run_daily_scan(date_str, universe):
     rows = []
     for sym in universe:
         try:
-            df = get_price_history(sym, start_days=130)
+            df = get_price_history(sym, start_days=150)
         except Exception:  # noqa: BLE001
             df = None
         m = _scan_metrics(df)
@@ -3210,6 +3222,43 @@ def _run_daily_scan(date_str, universe):
         _t.sleep(0.03)   # gentle throttle to stay under the 300/min Starter cap
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows, len(rows)
+
+
+def _scan_storage_path(date_str, kind):
+    return f"scans/{kind}_{date_str}.json"
+
+
+def _load_scan_from_storage(date_str, kind):
+    doc, _ = _gh_get_file(_scan_storage_path(date_str, kind))
+    if not doc or "ranked" not in doc:
+        return None
+    return doc["ranked"], doc.get("scanned", len(doc["ranked"]))
+
+
+def _save_scan_to_storage(date_str, kind, ranked, scanned):
+    if not _gh_configured():
+        return False
+    path = _scan_storage_path(date_str, kind)
+    _existing, sha = _gh_get_file(path)
+    return _gh_put_file(path, {"date": date_str, "scanned": scanned, "ranked": ranked},
+                        sha, message=f"Save {kind} scan for {date_str}")
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _get_daily_scan(date_str, universe, kind):
+    """Same result as _run_daily_scan, but checks a GitHub-persisted copy of
+    today's scan first. Without this, every cold app start (a redeploy, or
+    Streamlit Community Cloud waking from sleep) forces whoever opens the page
+    first through a fresh ~1-2 minute live scan \u2014 even though someone else
+    already paid that cost earlier today. With it, only the very first scan of
+    a new day (across ALL app instances, not just this browser) does the real
+    work; everyone else, including after a restart, reads the saved result."""
+    stored = _load_scan_from_storage(date_str, kind)
+    if stored is not None:
+        return stored
+    ranked, scanned = _run_daily_scan(date_str, universe)
+    _save_scan_to_storage(date_str, kind, ranked, scanned)   # best-effort; failure doesn't block rendering
+    return ranked, scanned
 
 
 def _delta_html(v, label):
@@ -3231,7 +3280,7 @@ def render_top_stocks():
                "scans ~500 names and takes a minute or two; after that it's cached and instant.")
     today = _dt.date.today()
     with st.spinner("Scanning the S&P 500 for today's trends\u2026  (first load of the day only)"):
-        ranked, scanned = _run_daily_scan(today.isoformat(), SP500)
+        ranked, scanned = _get_daily_scan(today.isoformat(), SP500, "top")
 
     if not ranked:
         st.info("Nothing to show yet. If this is the very first load it may still be warming up, or "
@@ -3277,7 +3326,7 @@ def render_top_stocks():
 
     for i, r in enumerate(top, 1):
         m = r["m"]
-        c = st.columns([3.4, 1.15, 1.15, 1.15, 1.0, 0.95])
+        c = st.columns([3.0, 1.0, 1.0, 1.0, 1.0, 0.85, 0.5])
         with c[0]:
             _px = r["m"].get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
@@ -3292,6 +3341,8 @@ def render_top_stocks():
         with c[3]:
             st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
         with c[4]:
+            st.markdown(_delta_html(m.get("r90"), "90D"), unsafe_allow_html=True)
+        with c[5]:
             vr = m["vol_ratio"]
             vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
             vcol = POS if (vr and vr >= 1.3) else MUTED
@@ -3299,11 +3350,12 @@ def render_top_stocks():
                         f"text-transform:uppercase'>Vol</div>"
                         f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
                         unsafe_allow_html=True)
-        with c[5]:
-            st.button("View \u2192", key=f"top_{r['symbol']}", use_container_width=True,
+        with c[6]:
+            st.button("\u2192", key=f"top_{r['symbol']}", use_container_width=True, help=f"View {r['symbol']}",
                       on_click=_view_stock, args=(r["symbol"],))
 
         label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
+        _flbl_text, _flbl_color = _focus_label(r["score"])
         b = st.columns([5.0, 1.0])
         with b[0]:
             st.markdown(
@@ -3315,7 +3367,8 @@ def render_top_stocks():
             st.markdown(
                 f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
                 f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
-                f"<span style='font-weight:700;font-size:1.1rem;color:{INK}'>{r['score']}</span></div>",
+                f"<span style='font-weight:700;font-size:1.02rem;color:{_flbl_color}'>"
+                f"{r['score']} | {_flbl_text}</span></div>",
                 unsafe_allow_html=True)
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
                     unsafe_allow_html=True)
@@ -3407,7 +3460,7 @@ def render_tracker():
 
     today = _dt.date.today()
     with st.spinner("Reading trend data for your tracked stocks\u2026"):
-        ranked, _scanned = _run_daily_scan(f"tracker-{today.isoformat()}", symbols)
+        ranked, _scanned = _get_daily_scan(today.isoformat(), symbols, "tracker")
 
     ranked_syms = {r["symbol"] for r in ranked}
     for r in ranked:
@@ -3441,7 +3494,7 @@ def render_tracker():
 
     for i, r in enumerate(ranked, 1):
         m = r["m"]
-        c = st.columns([3.2, 1.1, 1.1, 1.1, 0.9, 0.85, 0.45])
+        c = st.columns([2.9, 0.9, 0.9, 0.9, 0.9, 0.75, 0.4, 0.4])
         with c[0]:
             _px = m.get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
@@ -3458,6 +3511,8 @@ def render_tracker():
         with c[3]:
             st.markdown(_delta_html(m["r20"], "20D"), unsafe_allow_html=True)
         with c[4]:
+            st.markdown(_delta_html(m.get("r90"), "90D"), unsafe_allow_html=True)
+        with c[5]:
             vr = m["vol_ratio"]
             vtxt = f"{vr:.1f}\u00d7" if vr else "\u2014"
             vcol = POS if (vr and vr >= 1.3) else MUTED
@@ -3465,15 +3520,16 @@ def render_tracker():
                         f"text-transform:uppercase'>Vol</div>"
                         f"<div style='color:{vcol};font-weight:600'>{vtxt}</div>",
                         unsafe_allow_html=True)
-        with c[5]:
-            st.button("View \u2192", key=f"trk_view_{r['symbol']}", use_container_width=True,
-                      on_click=_view_stock, args=(r["symbol"],))
         with c[6]:
+            st.button("\u2192", key=f"trk_view_{r['symbol']}", use_container_width=True,
+                      help=f"View {r['symbol']}", on_click=_view_stock, args=(r["symbol"],))
+        with c[7]:
             if st.button("\u2715", key=f"trk_rm_{r['symbol']}", use_container_width=True,
                         help=f"Remove {r['symbol']} from tracker"):
                 _remove_now(r["symbol"])
 
         label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
+        _flbl_text, _flbl_color = _focus_label(r["score"])
         b = st.columns([5.0, 1.0])
         with b[0]:
             st.markdown(
@@ -3485,7 +3541,8 @@ def render_tracker():
             st.markdown(
                 f"<div style='text-align:right'><span style='font-size:.6rem;letter-spacing:.09em;"
                 f"color:{MUTED};text-transform:uppercase'>Focus</span><br>"
-                f"<span style='font-weight:700;font-size:1.1rem;color:{INK}'>{r['score']}</span></div>",
+                f"<span style='font-weight:700;font-size:1.02rem;color:{_flbl_color}'>"
+                f"{r['score']} | {_flbl_text}</span></div>",
                 unsafe_allow_html=True)
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
                     unsafe_allow_html=True)
@@ -3505,8 +3562,8 @@ def render_tracker():
             else:
                 st.caption("Not enough recent price history yet for a trend read.")
         with c[2]:
-            st.button("View \u2192", key=f"trk_view_{t['symbol']}", use_container_width=True,
-                      on_click=_view_stock, args=(t["symbol"],))
+            st.button("\u2192", key=f"trk_view_{t['symbol']}", use_container_width=True,
+                      help=f"View {t['symbol']}", on_click=_view_stock, args=(t["symbol"],))
         with c[3]:
             if st.button("\u2715", key=f"trk_rm_{t['symbol']}", use_container_width=True,
                         help=f"Remove {t['symbol']} from tracker"):
