@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.22.0"
+APP_VERSION = "0.22.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3997,8 +3997,16 @@ def _research_prompt_body(symbol):
         when = (existing.get("saved_at") or "")[:16].replace("T", " ")
         st.caption(f"Currently saved: pulled **{when}**. Saving again below will "
                    "**overwrite** this \u2014 there's only one saved report per stock.")
-        with st.expander("View currently saved report", expanded=False):
-            st.markdown(existing["raw"])
+        st.markdown(
+            "<style>.st-key-saved_report_box summary{"
+            "color:#FF4B4B !important;font-weight:600 !important;font-size:.95rem !important;}"
+            "</style>", unsafe_allow_html=True)
+        with st.container(key="saved_report_box"):
+            with st.expander("View currently saved report", expanded=False):
+                # Escape "$" so Streamlit doesn't read paired dollar amounts as LaTeX math
+                # (which was mashing numbers together, e.g. "$0.8B" + "$18.9B" -> garbled
+                # math-mode text with the spaces and bold markers stripped out).
+                st.markdown(existing["raw"].replace("$", "\\$"))
 
     st.caption("Already ran this externally? Paste the AI's response here and save it \u2014 "
                "this replaces whatever was saved before, and is stamped with today's date.")
