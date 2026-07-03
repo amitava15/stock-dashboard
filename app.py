@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.11.3"
+APP_VERSION = "0.11.4"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -2697,7 +2697,16 @@ def _pdf_range(a, b):
     return f"${a:,.0f} \u2013 ${b:,.0f}"
 
 
-def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes):
+def _pdf_escape(text):
+    """Escape text used inside ReportLab Paragraphs."""
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
+                quarterly=None, forward=None, benchmark=None, quality=None):
     _pdf_fonts()
     S = _pdf_styles()
     W, H = _LETTER
@@ -2753,6 +2762,19 @@ def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn,
                                      ("Free Cash Flow", ty, tm.get("fcf"), "money"),
                                      ("Total Debt", ty, tm.get("debt"), "money")], ncols=2), 6.5))
 
+    quarterly = quarterly or {"labels": [], "metrics": {}}
+    qy, qm = quarterly.get("labels") or [], quarterly.get("metrics") or {}
+    if qy and any((qm.get(k) or []) for k in ("revenue", "eps", "gross_margin", "op_margin", "net_margin", "fcf")):
+        story += _pdf_section("Recent Quarters", "the latest few quarters up close", S)
+        story.append(_pdf_img(_pdf_grid([("Revenue", qy, qm.get("revenue"), "money"),
+                                         ("EPS (diluted)", qy, qm.get("eps"), "eps"),
+                                         ("Gross Margin", qy, qm.get("gross_margin"), "pct"),
+                                         ("Operating Margin", qy, qm.get("op_margin"), "pct"),
+                                         ("Net Margin", qy, qm.get("net_margin"), "pct"),
+                                         ("Free Cash Flow", qy, qm.get("fcf"), "money")],
+                                        ncols=2, cell_h=1.35), 6.5))
+        story.append(Paragraph("Quarterly data highlights inflections that annual charts can hide, especially for cyclical companies.", S["note"]))
+
     cy, cm = cash["years"], cash["metrics"]
     story += _pdf_section("Cash Generation", "does it make real money?", S)
     story.append(_pdf_img(_pdf_grid([("Free Cash Flow", cy, cm.get("fcf"), "money"),
@@ -2766,20 +2788,80 @@ def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn,
     story.append(_pdf_tiles([("P/E", num(cur.get("pe"))), ("Forward P/E", num(cur.get("forward_pe"))),
                              ("PEG", num(cur.get("peg"))), ("EV/EBITDA", num(cur.get("ev_ebitda"))),
                              ("P/S", num(cur.get("ps"))), ("FCF Yield", pct(cur.get("fcf_yield")))], S, cols=3))
+
+    forward = forward or {"years": []}
+    fy_rows = forward.get("years") or []
+    if fy_rows:
+        story.append(Paragraph("FORWARD VALUATION", S["subg"]))
+        ftiles = []
+        for y in fy_rows[:3]:
+            fy = y.get("fiscal_year") or "?"
+            eps_v, fpe_v, rev_v = to_float(y.get("eps")), to_float(y.get("forward_pe")), to_float(y.get("revenue"))
+            note_bits = []
+            if fpe_v is not None:
+                note_bits.append(f"{fpe_v:,.1f}x fwd P/E")
+            if rev_v is not None:
+                note_bits.append(f"{big_money(rev_v)} revenue")
+            n = to_float(y.get("n_eps")) or to_float(y.get("n_rev"))
+            if n is not None:
+                note_bits.append(f"{int(n)} analysts")
+            ftiles.append((f"FY{fy} est. EPS", money(eps_v), " · ".join(note_bits)))
+        story.append(_pdf_tiles(ftiles, S, cols=3))
+
     story.append(Paragraph("GROWTH CONTEXT (YoY)", S["subg"]))
     story.append(_pdf_tiles([("Revenue", pct(gro.get("revenue"))), ("EPS", pct(gro.get("eps"))),
                              ("Free Cash Flow", pct(gro.get("fcf")))], S, cols=3))
-    story.append(Paragraph("HISTORICAL CONTEXT (now vs 5-yr median)", S["subg"]))
+    story.append(Paragraph("HISTORICAL CONTEXT", S["subg"]))
 
     def _hrow(k, lbl):
         d = his.get(k, {})
         now, med = to_float(d.get("now")), to_float(d.get("median"))
-        if now is not None and med is not None:
-            tag = "above" if now > med else "below" if now < med else "in line"
-            return (lbl, num(now), f"5-yr median {num(med)} \u00b7 {tag}")
-        return (lbl, num(now), "median n/a")
+        if med is not None:
+            if now is not None and med != 0:
+                ratio = now / med
+                tag = "trading above" if ratio >= 1.15 else "trading below" if ratio <= 0.85 else "trading near"
+                return (f"{lbl} 5-yr median", num(med), f"Now {num(now)} · {tag}")
+            return (f"{lbl} 5-yr median", num(med), "Current value unavailable")
+        return (f"{lbl} 5-yr median", "N/A", f"Now {num(now)}")
 
     story.append(_pdf_tiles([_hrow("pe", "P/E"), _hrow("ev", "EV/EBITDA"), _hrow("ps", "P/S")], S, cols=3))
+
+    benchmark = benchmark or None
+    if benchmark and benchmark.get("rows"):
+        story.append(Paragraph("VERSUS INDUSTRY PEERS", S["subg"]))
+        grp = benchmark.get("industry") if benchmark.get("grouping") != "sector" and benchmark.get("industry") else benchmark.get("sector")
+        peers = benchmark.get("peers") or []
+        if peers:
+            peer_bits = " · ".join(f"{p.get('symbol')} {p.get('name')}" for p in peers[:10])
+            story.append(Paragraph(_pdf_escape(f"Peer set: {peer_bits}"), S["note"]))
+        peer_tiles = []
+        for row in benchmark.get("rows", [])[:6]:
+            unit = row.get("unit")
+            tgt, p25, p75 = row.get("target"), row.get("p25"), row.get("p75")
+            if tgt is not None and p25 is not None and p75 is not None:
+                if tgt > p75:
+                    pos = "above peer range"
+                elif tgt < p25:
+                    pos = "below peer range"
+                else:
+                    pos = "within peer range"
+            else:
+                pos = "company value unavailable"
+            peer_range = f"{_fmt_bench(p25, unit)} – {_fmt_bench(p75, unit)}"
+            note = f"Median: {_fmt_bench(row.get('median'), unit)} · {int(row.get('n') or 0)} peers · {symbol.upper()} is {pos}"
+            peer_tiles.append((row.get("label", "Peer metric"), peer_range, note))
+        story.append(_pdf_tiles(peer_tiles, S, cols=3))
+        story.append(Paragraph("Peer ranges use the 25th–75th percentile. Median is the middle value, so extreme outliers do not dominate the comparison.", S["note"]))
+
+    quality = quality or {"missing_fields": [], "notes": []}
+    qnotes = list(quality.get("notes") or [])
+    missing = list(quality.get("missing_fields") or [])
+    if qnotes or missing:
+        story.append(Paragraph("DATA QUALITY NOTES", S["subg"]))
+        if missing:
+            story.append(Paragraph(_pdf_escape("Missing fields: " + ", ".join(missing)), S["note"]))
+        for n in qnotes[:6]:
+            story.append(Paragraph("• " + _pdf_escape(n), S["note"]))
 
     story += _pdf_section("Analyst Expectations", "what the market already expects", S)
     story.append(Paragraph("CONSENSUS", S["subg"]))
@@ -2877,6 +2959,10 @@ def build_pdf_report(symbol):
     analyst = get_analyst(symbol)
     earn = get_earnings_context(symbol)
     tech = get_technicals(symbol)
+    quarterly = get_quarterly_trend(symbol)
+    forward = get_forward_estimates(symbol, n=3)
+    benchmark = get_industry_benchmark(symbol)
+    quality = compute_quality_flags(symbol)
     closes = None
     try:
         df = get_price_history(symbol)
@@ -2888,7 +2974,8 @@ def build_pdf_report(symbol):
         closes = None
     ai_text = st.session_state.get("ai_analysis", {}).get(symbol)
     notes = st.session_state.get(f"notes_{symbol}", "")
-    return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes)
+    return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
+                       quarterly=quarterly, forward=forward, benchmark=benchmark, quality=quality)
 
 
 def render_pdf_fab(symbol):
