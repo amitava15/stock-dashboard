@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.18.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3893,8 +3893,20 @@ def _gh_put_file(path, data, sha=None, message="update"):
 
 # ------------------------- saved research notes -------------------------
 
+NOTE_MAX_CHARS = 20000   # a real research note is a few paragraphs; a mispasted
+                          # source file or whole document is orders of magnitude bigger
+
+
 def save_research_note(symbol, name, kind, payload):
-    """Appends one saved Context/summary for a symbol to notes/{SYMBOL}.json."""
+    """Appends one saved Context/summary for a symbol to notes/{SYMBOL}.json.
+    Rejects payloads that are implausibly large for a research note \u2014 a
+    guard against an accidental mispaste (or anything else) silently
+    overwriting real saved data with something huge."""
+    size = len(_json.dumps(payload))
+    if size > NOTE_MAX_CHARS:
+        return False, (f"That's too large to be a research note ({size:,} characters, limit "
+                       f"{NOTE_MAX_CHARS:,}) \u2014 looks like something other than a research "
+                       "summary got pasted in. Nothing was saved.")
     path = f"notes/{symbol.upper()}.json"
     existing, sha = _gh_get_file(path)
     doc = existing or {"symbol": symbol.upper(), "name": name, "entries": []}
@@ -3902,7 +3914,8 @@ def save_research_note(symbol, name, kind, payload):
         "kind": kind, "saved_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "data": payload,
     })
     doc["entries"] = doc["entries"][:20]   # keep it bounded
-    return _gh_put_file(path, doc, sha, message=f"Save {kind} note for {symbol.upper()}")
+    ok = _gh_put_file(path, doc, sha, message=f"Save {kind} note for {symbol.upper()}")
+    return ok, (None if ok else "Couldn't save \u2014 check GitHub storage setup.")
 
 
 def get_saved_notes(symbol):
@@ -4575,8 +4588,8 @@ def _render_context_card(res, symbol, name, show_save=True, nested=False):
 
     if show_save:
         if st.button("Save this summary", key=f"ctxsavebtn_{symbol}", use_container_width=False):
-            ok = save_research_note(symbol, name, "context", res)
-            st.success("Saved." if ok else "Couldn't save \u2014 check GitHub storage setup.")
+            ok, msg = save_research_note(symbol, name, "context", res)
+            st.success("Saved.") if ok else st.warning(msg)
 
 
 def _context_prompt_body(symbol, name):
@@ -4597,13 +4610,13 @@ def _context_prompt_body(symbol, name):
     pasted = st.text_area("Paste the AI's response here", key=paste_key, height=160)
     if st.button("Save pasted response", key=f"ctxpastesave_{symbol}"):
         if pasted.strip():
-            ok = save_research_note(symbol, name, "external", {"raw": pasted.strip()})
+            ok, msg = save_research_note(symbol, name, "external", {"raw": pasted.strip()})
             if ok:
                 st.session_state[clear_flag] = True
                 st.success("Saved.")
                 st.rerun()
             else:
-                st.warning("Couldn't save \u2014 check GitHub storage setup.")
+                st.warning(msg)
         else:
             st.warning("Paste something first.")
 
