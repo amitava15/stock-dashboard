@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.19.1"
+APP_VERSION = "0.19.2"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3334,22 +3334,20 @@ def render_top_stocks():
 # on any stock's own page; remove from here.
 # ===========================================================================
 
-def _tracker_add():
-    import time as _time2
-    q = st.session_state.get("tracker_add_box", "").strip()
-    st.session_state.tracker_add_box = ""
-    if not q:
-        return
-    now = _time2.time()
-    last_q, last_t = st.session_state.get("_tracker_last_add", (None, 0))
-    if q.upper() == (last_q or "").upper() and (now - last_t) < 3:
-        return   # the same text fired twice within 3s (e.g. Enter + a button click on the
-                 # same submission) \u2014 treat as one event, not two separate adds
-    st.session_state["_tracker_last_add"] = (q, now)
-    sym, _name = _resolve_symbol(q)
-    if sym:
-        ok, msg = add_to_tracker(sym)
-        st.session_state.tracker_add_msg = (ok, f"{sym}: {msg}")
+def _tracker_resolve_and_validate(q):
+    """Resolve typed text to a symbol AND confirm it's a real, currently
+    quotable security before anything gets added \u2014 this is what stops
+    'Facebook' or 'Google' (old company names FMP's search won't match)
+    from being stored as literal, nonexistent tickers."""
+    sym, name_hint = _resolve_symbol(q)
+    if not sym:
+        return None, None, f"Couldn't resolve \u201c{q}\u201d to a stock."
+    quote = get_quote(sym)
+    if not quote:
+        return None, None, (f"Couldn't find a real, currently-traded stock for \u201c{q}\u201d \u2014 "
+                            "try the current ticker or company name (e.g. META for Meta Platforms, "
+                            "GOOGL for Alphabet).")
+    return sym, (name_hint or quote.get("name")), None
 
 
 def render_tracker():
@@ -3359,27 +3357,47 @@ def render_tracker():
                "classification and Focus Priority scoring as Top Stocks to Explore, so you can spot "
                "movement in names you already care about, not just what's loudest today.")
 
+    # A pending message from the PREVIOUS run (set right before a rerun below) is
+    # shown here, AFTER the fresh data for this run has already been read \u2014
+    # so the confirmation only ever appears alongside the state it describes.
+    pending = st.session_state.pop("_tracker_msg", None)
+
+    # Clear the add box before instantiating it, if the previous run asked us to
+    # (Streamlit won't allow setting a widget's session-state value after it's
+    # already been created in the same run \u2014 this has to happen first).
+    if st.session_state.pop("_tracker_clear_box", False):
+        st.session_state["tracker_add_box"] = ""
+
     entries = get_tracker()
     at_cap = len(entries) >= TRACKER_MAX
 
     c_in, c_btn = st.columns([5, 1])
     with c_in:
-        st.text_input("Add", key="tracker_add_box", label_visibility="collapsed",
-                      placeholder="Add a company or ticker \u2014 e.g. Amazon or AMZN",
-                      on_change=_tracker_add, disabled=at_cap)
+        add_q = st.text_input("Add", key="tracker_add_box", label_visibility="collapsed",
+                              placeholder="Add a company or ticker \u2014 e.g. Amazon or AMZN",
+                              disabled=at_cap)
     with c_btn:
-        st.button("Add", use_container_width=True, on_click=_tracker_add, disabled=at_cap)
+        add_clicked = st.button("Add", use_container_width=True, disabled=at_cap)
 
-    msg = st.session_state.pop("tracker_add_msg", None)
-    if msg:
-        ok, text = msg
+    if add_clicked and add_q.strip():
+        sym, name, err = _tracker_resolve_and_validate(add_q.strip())
+        if err:
+            st.warning(err)
+        else:
+            ok, msg = add_to_tracker(sym)   # writes, then clears get_tracker's cache internally
+            st.session_state["_tracker_msg"] = (ok, f"{sym}: {msg}")
+            st.session_state["_tracker_clear_box"] = True
+            st.rerun()   # fresh run: get_tracker() below will read the just-written state
+
+    if pending:
+        ok, text = pending
         (st.success if ok else st.warning)(text)
     if at_cap:
         st.caption(f"That's the maximum of {TRACKER_MAX} \u2014 remove one below to add another.")
 
     if not entries:
         st.info("Nothing tracked yet. Add a stock above, or open any stock's page and use "
-                "**Track this stock**.")
+                "the \u2606 star to track it.")
         return
 
     added_by_sym = {e["symbol"]: e.get("added", "") for e in entries}
@@ -3396,26 +3414,31 @@ def render_tracker():
             r["why"] = _why_explore(r["m"], r["trend"])
     ranked.sort(key=lambda r: r["score"], reverse=True)
 
-    # Any tracked symbol without enough price history still needs to show up —
-    # it just can't get a trend read yet, rather than silently vanishing.
+    # Any tracked symbol without enough price history still needs to show up \u2014
+    # it just can't get a trend read yet, rather than silently vanishing. (A
+    # symbol that's genuinely invalid \u2014 e.g. a leftover bad entry from before
+    # validation existed \u2014 also lands here, with price left blank, so it's
+    # visibly wrong and easy to Remove rather than silently missing.)
     thin = []
     for sym in symbols:
         if sym not in ranked_syms:
             q = get_quote(sym)
-            thin.append({"symbol": sym, "name": get_company_profile(sym).get("name") or sym,
-                        "price": q.get("price")})
+            nm = get_company_profile(sym).get("name") if q else None
+            thin.append({"symbol": sym, "name": nm or sym, "price": q.get("price"),
+                        "invalid": not q})
 
     st.caption(f"Tracking {len(entries)} of {TRACKER_MAX}.")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
                 unsafe_allow_html=True)
 
-    def _remove_row(sym):
+    def _remove_now(sym):
         ok, msg = remove_from_tracker(sym)
-        st.session_state.tracker_add_msg = (ok, f"{sym}: {msg}")
+        st.session_state["_tracker_msg"] = (ok, f"{sym}: {msg}")
+        st.rerun()
 
     for i, r in enumerate(ranked, 1):
         m = r["m"]
-        c = st.columns([3.0, 1.1, 1.1, 1.1, 0.9, 0.85, 0.85])
+        c = st.columns([3.2, 1.1, 1.1, 1.1, 0.9, 0.85, 0.45])
         with c[0]:
             _px = m.get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
@@ -3443,8 +3466,9 @@ def render_tracker():
             st.button("View \u2192", key=f"trk_view_{r['symbol']}", use_container_width=True,
                       on_click=_view_stock, args=(r["symbol"],))
         with c[6]:
-            st.button("Remove", key=f"trk_rm_{r['symbol']}", use_container_width=True,
-                      on_click=_remove_row, args=(r["symbol"],))
+            if st.button("\u2715", key=f"trk_rm_{r['symbol']}", use_container_width=True,
+                        help=f"Remove {r['symbol']} from tracker"):
+                _remove_now(r["symbol"])
 
         label, lcolor = _TREND_LABEL.get(r["trend"], (r["trend"].upper(), MUTED))
         b = st.columns([5.0, 1.0])
@@ -3464,7 +3488,7 @@ def render_tracker():
                     unsafe_allow_html=True)
 
     for t in thin:
-        c = st.columns([3.0, 3.3, 0.85, 0.85])
+        c = st.columns([3.2, 3.1, 0.85, 0.45])
         with c[0]:
             _pxs = f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>${t['price']:,.2f}</span>" \
                 if t.get("price") is not None else ""
@@ -3473,22 +3497,22 @@ def render_tracker():
                         f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
                         f"{added_by_sym.get(t['symbol'], '') or '\u2014'}</div>", unsafe_allow_html=True)
         with c[1]:
-            st.caption("Not enough recent price history yet for a trend read.")
+            if t.get("invalid"):
+                st.caption("This ticker doesn't look valid anymore \u2014 consider removing it.")
+            else:
+                st.caption("Not enough recent price history yet for a trend read.")
         with c[2]:
             st.button("View \u2192", key=f"trk_view_{t['symbol']}", use_container_width=True,
                       on_click=_view_stock, args=(t["symbol"],))
         with c[3]:
-            st.button("Remove", key=f"trk_rm_{t['symbol']}", use_container_width=True,
-                      on_click=_remove_row, args=(t["symbol"],))
+            if st.button("\u2715", key=f"trk_rm_{t['symbol']}", use_container_width=True,
+                        help=f"Remove {t['symbol']} from tracker"):
+                _remove_now(t["symbol"])
         st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.55rem 0'>",
                     unsafe_allow_html=True)
 
     st.caption("Focus Priority and trend labels use the same logic as Top Stocks to Explore \u2014 a "
                "starting point for research, not a signal to trade.")
-
-
-
-
 
 
 # ===========================================================================
@@ -5387,15 +5411,17 @@ def show_ticker(symbol):
     render_pdf_fab(symbol)   # floating PDF button, reachable from any tab
 
     _tracked = is_tracked(symbol)
-    tcol, _sp = st.columns([1.6, 5])
+    tcol, _sp = st.columns([0.6, 6])
     with tcol:
         if _tracked:
-            if st.button("\u2605 Tracked \u2014 remove", key=f"untrack_{symbol}", use_container_width=True):
+            if st.button("\u2605", key=f"untrack_{symbol}",
+                        help=f"Remove {symbol} from My Stock Tracker"):
                 ok, msg = remove_from_tracker(symbol)
                 st.session_state["_track_msg"] = (ok, msg)
                 st.rerun()
         else:
-            if st.button("\u2606 Track this stock", key=f"track_{symbol}", use_container_width=True):
+            if st.button("\u2606", key=f"track_{symbol}",
+                        help=f"Track {symbol} in My Stock Tracker"):
                 ok, msg = add_to_tracker(symbol)
                 st.session_state["_track_msg"] = (ok, msg)
                 st.rerun()
