@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.12.1"
+APP_VERSION = "0.13.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3601,6 +3601,20 @@ def _handoff(text):
         f"{text}</div>", unsafe_allow_html=True)
 
 
+def _trend_block(title, reads):
+    reads = [r for r in reads if r]
+    if not reads:
+        return
+    body = "".join(f"<div style='margin:.12rem 0'>\u2022 {r}</div>" for r in reads)
+    st.markdown(
+        f"<div style='background:rgba(122,121,112,.06);border:1px solid {LINE};border-radius:10px;"
+        f"padding:.75rem 1rem;margin:.4rem 0 .3rem;max-width:52rem'>"
+        f"<div style='letter-spacing:.08em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
+        f"margin-bottom:.35rem'>{title}</div>"
+        f"<div style='font-size:.92rem;line-height:1.5;color:{INK}'>{body}</div></div>",
+        unsafe_allow_html=True)
+
+
 def _join_clauses(items):
     items = [x for x in items if x]
     if not items:
@@ -3608,6 +3622,96 @@ def _join_clauses(items):
     if len(items) == 1:
         return items[0]
     return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _fmt_v(v, kind):
+    if v is None:
+        return "n/a"
+    if kind == "money_b":
+        return f"${v / 1e9:.1f}B"
+    if kind == "money":
+        return f"${v:,.2f}"
+    if kind == "pct":
+        return f"{v:.0f}%"
+    return f"{v:,.1f}"
+
+
+def _series_read(values, labels, kind, name):
+    """Turn a fundamentals time-series into one plain-English insight sentence
+    (trough-to-recovery, steady climb, decline, peak-and-fade, or choppy)."""
+    pairs = [(labels[i] if labels and i < len(labels) else str(i), to_float(v))
+             for i, v in enumerate(values)]
+    pairs = [(l, v) for l, v in pairs if v is not None]
+    if len(pairs) < 3:
+        return None
+    vals = [v for _, v in pairs]
+    n = len(vals)
+    first_l, first = pairs[0]
+    last_l, last = pairs[-1]
+    lo_l, lo = min(pairs, key=lambda t: t[1])
+    hi_l, hi = max(pairs, key=lambda t: t[1])
+    labs = [l for l, _ in pairs]
+    lo_i, hi_i = labs.index(lo_l), labs.index(hi_l)
+    ups = sum(1 for a, b in zip(vals, vals[1:]) if b > a)
+    steps = n - 1
+    rng = hi - lo
+    unit = "years" if str(first_l).startswith(("FY", "20")) else "quarters"
+
+    def f(v):
+        return _fmt_v(v, kind)
+
+    if 0 < lo_i < n - 1 and lo < first and lo < last and (last - lo) > rng * 0.5:
+        record = " \u2014 a record high" if last >= hi else ""
+        return (f"{name} dropped to a low of {f(lo)} in {lo_l}, then recovered to {f(last)} in "
+                f"{last_l}{record}.")
+    if 0 < hi_i < n - 1 and hi > first and hi > last and (hi - last) > rng * 0.5:
+        return f"{name} peaked at {f(hi)} in {hi_l} and has since faded to {f(last)} in {last_l}."
+    if ups >= steps - 1 and last > first:
+        return (f"{name} has climbed almost every period, from {f(first)} in {first_l} to {f(last)} in "
+                f"{last_l} (up in {ups} of {steps}).")
+    if ups <= 1 and last < first:
+        return (f"{name} has fallen from {f(first)} in {first_l} to {f(last)} in {last_l} "
+                f"(down in {steps - ups} of {steps} {unit}).")
+    return (f"{name} has been choppy \u2014 between {f(lo)} and {f(hi)} \u2014 ending at {f(last)} in "
+            f"{last_l} (up in {ups} of {steps} {unit}).")
+
+
+def _sector_lens(profile):
+    """Tailor the business framing to the company's industry, so a biotech reads
+    as a pipeline story and a chipmaker as a cycle story \u2014 instead of one
+    generic 'cyclical' line for everything."""
+    sec = (profile.get("sector") or "").lower()
+    ind = (profile.get("industry") or "").lower()
+    if "semiconductor" in ind or "semiconductor" in sec:
+        return {
+            "durability": ("Semiconductors are deeply cyclical, so today's strong margins can be a "
+                           "<i>cycle peak</i> rather than the new normal \u2014 the question is whether "
+                           "the current up-cycle (AI-memory demand, in Micron's case) is durable or "
+                           "near its top."),
+            "turnaround": ("For a chipmaker, red ink usually marks a <i>cycle trough</i> rather than a "
+                           "broken business \u2014 the question is whether the next up-cycle arrives "
+                           "before cash gets tight."),
+            "verify_extra": " Because it's cyclical, judge margins across a full cycle, not off the "
+                            "latest quarter.",
+        }
+    if ("biotech" in ind or "drug" in ind or "pharmaceutical" in ind
+            or ("healthcare" in sec and ("bio" in ind or "pharma" in ind))):
+        return {
+            "durability": ("For a drug maker, margins ride on a handful of key products \u2014 watch "
+                           "for a patent cliff or loss of exclusivity, which can reset revenue quickly."),
+            "turnaround": ("For a biotech or pharma name, this usually reads as a <b>pipeline or "
+                           "post-product reset</b> \u2014 the real question is whether the drug pipeline "
+                           "can rebuild durable revenue before cash runs low."),
+            "verify_extra": " For a pipeline story, weigh clinical/approval milestones and cash runway, "
+                            "not margins.",
+        }
+    return {
+        "durability": ("<i>If</i> this is a cyclical business or an unusually strong stretch, today's "
+                       "margins can be a peak rather than the norm \u2014 which flatters every "
+                       "profitability number at once."),
+        "turnaround": None,
+        "verify_extra": "",
+    }
 
 
 def render_guided(symbol, quote, profile, metrics):
@@ -3639,6 +3743,9 @@ def render_guided(symbol, quote, profile, metrics):
     an = get_analyst(sym)
     ea = get_earnings_context(sym)
     tech = get_technicals(sym)
+    traj = get_trajectory_annual(sym)
+    cashn = get_cash_annual(sym)
+    quar = get_quarterly_trend(sym)
     cur, gro, hist = val["current"], val["growth"], val["history"]
 
     # Company-condition flags that make the guidance adaptive (the fix the MRNA
@@ -3648,6 +3755,7 @@ def render_guided(symbol, quote, profile, metrics):
     _rev0 = to_float(gro.get("revenue"))
     loss_making = (_nm0 is not None and _nm0 < 0) or (_pe0 is not None and _pe0 < 0)
     shrinking = _rev0 is not None and _rev0 < 0
+    lens = _sector_lens(profile)
 
     # ---- how to read this stock ----
     st.markdown(
@@ -3716,13 +3824,25 @@ def render_guided(symbol, quote, profile, metrics):
     rev_g = to_float(gro.get("revenue"))
     nm, gm = to_float(metrics.get("net_margin_pct")), to_float(metrics.get("gross_margin_pct"))
     roe = to_float(metrics.get("roe_pct"))
-    c = st.columns(3)
+    tyr, tm = traj.get("years") or [], traj.get("metrics") or {}
+    c = st.columns(4)
     _s, _t = _sign_signal(rev_g)
     metric_tile(c[0], "Revenue Growth (YoY)", pct(rev_g), "revenue_growth", status=_s, status_tone=_t)
+    _s, _t = _margin_signal(gm, gross=True)
+    metric_tile(c[1], "Gross Margin", pct(gm), "gross_margin", status=_s, status_tone=_t)
     _s, _t = _margin_signal(nm, gross=False)
-    metric_tile(c[1], "Net Margin", pct(nm), "net_margin", status=_s, status_tone=_t)
+    metric_tile(c[2], "Net Margin", pct(nm), "net_margin", status=_s, status_tone=_t)
     _s, _t = _roe_signal(roe)
-    metric_tile(c[2], "Return on Equity", pct(roe), "roe", status=_s, status_tone=_t)
+    metric_tile(c[3], "Return on Equity", pct(roe), "roe", status=_s, status_tone=_t)
+
+    # read the multi-year trajectory aloud (this is the data Guide Me used to only point at)
+    reads = []
+    for key, lbl, kind in [("revenue", "Revenue", "money_b"), ("net_margin", "Net margin", "pct"),
+                           ("gross_margin", "Gross margin", "pct"), ("roe", "ROE", "pct"),
+                           ("debt", "Total debt", "money_b")]:
+        reads.append(_series_read(tm.get(key, []), tyr, kind, lbl))
+    _trend_block("The five-year trajectory", reads)
+
     bits = []
     if loss_making or shrinking:
         sent = []
@@ -3736,16 +3856,17 @@ def render_guided(symbol, quote, profile, metrics):
             sent.append(f"net margin sits around {nm:.0f}%")
         lead = _join_clauses(sent)
         lead = (lead[0].upper() + lead[1:] + ". ") if lead else ""
+        turn = (" " + lens["turnaround"]) if lens.get("turnaround") else ""
         _guide_para(
             lead
-            + f"Numbers like these mean {name} is better read as a <b>turnaround or reset story</b> "
-            "than a steady quality-growth business right now. The question isn't 'how good are the "
-            "margins' \u2014 it's 'is the business rebuilding': is revenue stabilizing, and is the loss "
-            "getting smaller quarter over quarter?")
+            + f"Read alongside the trajectory above, {name} is better understood as a <b>turnaround or "
+            "reset story</b> than a steady quality-growth business right now." + turn + " Either way, "
+            "the question isn't 'how good are the margins' \u2014 it's 'is the business rebuilding': is "
+            "revenue stabilizing, and is the loss getting smaller?")
         _verify_line(
             "whether the loss is <i>shrinking</i> and revenue is <i>stabilizing</i> over the last few "
-            "quarters. A turnaround only works if the trend is bending the right way \u2014 pull up the "
-            "multi-year and quarterly trajectory and check the direction, not just the latest level.")
+            "quarters \u2014 the quarterly read below is where you see that first."
+            + lens.get("verify_extra", ""))
     else:
         if rev_g is not None:
             bits.append(f"growing revenue about {abs(rev_g):.0f}% a year")
@@ -3754,15 +3875,20 @@ def render_guided(symbol, quote, profile, metrics):
         if roe is not None:
             bits.append(f"earning roughly {roe:.0f}% on shareholders' equity")
         _guide_para(
-            (f"{name} is " + _join_clauses(bits) + ". " if bits else "")
+            (f"Today {name} is " + _join_clauses(bits) + ". " if bits else "")
             + "High, rising margins with strong returns usually point to real pricing power and a "
-            "business getting more efficient. The main caveat is durability: <i>if</i> this is a "
-            "cyclical business or an unusually strong stretch, today's margins can be a peak rather "
-            "than the norm \u2014 which flatters every profitability number at once.")
+            "business getting more efficient \u2014 and the trajectory above tells you whether that's a "
+            "steady build or a sharp bounce. The main caveat is durability: " + lens["durability"])
         _verify_line(
-            "whether margins are still <i>rising</i> or merely <i>high</i>. Pull up the multi-year "
-            "trajectory: steadily climbing margins are a quality sign; a sharp spike after a slump "
-            "often doesn't hold.")
+            "whether the trajectory is still bending upward or starting to roll over. Steadily climbing "
+            "margins are a quality sign; a sharp spike after a slump often doesn't hold."
+            + lens.get("verify_extra", ""))
+
+    # quarterly momentum — the freshest signal
+    ql, qm = quar.get("labels") or [], quar.get("metrics") or {}
+    qreads = [_series_read(qm.get("revenue", []), ql, "money_b", "Revenue"),
+              _series_read(qm.get("net_margin", []), ql, "pct", "Net margin")]
+    _trend_block(f"The last {len(ql)} quarters", qreads)
     _handoff("Profit on paper isn't the same as money in the bank \u2014 so next, does it turn into "
              "cash?")
 
@@ -3780,6 +3906,11 @@ def render_guided(symbol, quote, profile, metrics):
     metric_tile(c[0], "FCF Yield", pct(fcf_y), "fcf_yield", status=_s, status_tone=_t)
     _s, _t = _sign_signal(fcf_g)
     metric_tile(c[1], "FCF Growth (YoY)", pct(fcf_g), "fcf_growth", status=_s, status_tone=_t)
+    cyr, cm = cashn.get("years") or [], cashn.get("metrics") or {}
+    _trend_block("Free cash flow over time", [
+        _series_read(cm.get("fcf", []), cyr, "money_b", "Free cash flow"),
+        _series_read(cm.get("fcf_margin", []), cyr, "pct", "FCF margin"),
+    ])
     if fcf_y is not None and fcf_y < 0:
         _guide_para(
             "Free cash flow is what's left after a company funds its operations and investments \u2014 "
@@ -3891,6 +4022,14 @@ def render_guided(symbol, quote, profile, metrics):
                 "what the price assumes about future profit. With no forward P/E available here, lean on "
                 "the revenue trend and analyst estimates \u2014 is the market paying for growth that the "
                 "forecasts actually support?")
+    hist_reads = []
+    for _k, _lbl in [("pe", "P/E"), ("ev", "EV/EBITDA"), ("ps", "P/S")]:
+        _hd = hist.get(_k) or {}
+        _now, _med = to_float(_hd.get("now")), to_float(_hd.get("median"))
+        if _now is not None and _med is not None and _now > 0:
+            hist_reads.append(f"{_lbl} of {num(_now)}\u00d7 sits {'above' if _now > _med else 'below'} "
+                              f"its 5-year median of {num(_med)}\u00d7")
+    _trend_block("Versus its own 5-year history", hist_reads)
     _handoff("Price only makes sense against expectations \u2014 so next, what is the market already "
              "counting on?")
 
@@ -3908,6 +4047,16 @@ def render_guided(symbol, quote, profile, metrics):
     metric_tile(c[1], "Avg price target", money(tgt.get("avg")), "price_target")
     _s, _t = _sign_signal(upside, pos="upside", neg="downside")
     metric_tile(c[2], "Implied upside", pct(upside), "implied_upside", status=_s, status_tone=_t)
+    fwd_e = an.get("forward") or {}
+    c2 = st.columns(3)
+    with c2[0]:
+        st.metric("Target range", money_range(tgt.get("low"), tgt.get("high")))
+    with c2[1]:
+        st.metric(f"Est. revenue FY{str(fwd_e.get('year') or '')[-2:]}",
+                  big_money(fwd_e.get("revenue")) if fwd_e.get("revenue") else "\u2014")
+    with c2[2]:
+        st.metric(f"Est. EPS FY{str(fwd_e.get('year') or '')[-2:]}",
+                  money(fwd_e.get("eps")) if fwd_e.get("eps") is not None else "\u2014")
     _guide_para(
         (f"Analysts lean {'bullish' if n_buy > (n_hold + n_sell) else 'mixed'} here \u2014 roughly "
          f"{int(n_buy)} buy, {int(n_hold)} hold, {int(n_sell)} sell. " if (n_buy or n_hold or n_sell) else "")
@@ -3936,6 +4085,18 @@ def render_guided(symbol, quote, profile, metrics):
         st.metric("From 52-wk high", pct(dist_high) if dist_high is not None else "\u2014")
     _s, _t = _beta_signal(beta)
     metric_tile(c[2], "Beta", num(beta), "beta", status=_s, status_tone=_t)
+    dist_low = to_float(tech.get("dist_low"))
+    vol_ratio = to_float(tech.get("vol_ratio"))
+    c2 = st.columns(3)
+    with c2[0]:
+        _a50 = tech.get("above_50")
+        st.metric("Vs 50-day avg", "Above" if _a50 else ("Below" if _a50 is False else "\u2014"))
+    with c2[1]:
+        _a200 = tech.get("above_200")
+        st.metric("Vs 200-day avg", "Above" if _a200 else ("Below" if _a200 is False else "\u2014"))
+    _s, _t = _debt_signal(metrics.get("debt_to_equity"))
+    metric_tile(c2[2], "Debt / Equity", num(metrics.get("debt_to_equity")), "debt_equity",
+                status=_s, status_tone=_t)
     _guide_para(
         (f"Momentum (RSI) sits at {rsi:.0f}"
          + (" \u2014 in the stretched zone above 70, meaning the stock has run hard and fast" if (rsi or 0) >= 70
