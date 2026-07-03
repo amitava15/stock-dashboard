@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.19.2"
+APP_VERSION = "0.19.3"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3380,18 +3380,20 @@ def render_tracker():
         add_clicked = st.button("Add", use_container_width=True, disabled=at_cap)
 
     if add_clicked and add_q.strip():
-        sym, name, err = _tracker_resolve_and_validate(add_q.strip())
+        with st.spinner(f"Adding {add_q.strip()}\u2026"):
+            sym, name, err = _tracker_resolve_and_validate(add_q.strip())
+            if not err:
+                ok, msg = add_to_tracker(sym)   # writes, then clears get_tracker's cache internally
         if err:
-            st.warning(err)
+            _toast(err, ok=False)
         else:
-            ok, msg = add_to_tracker(sym)   # writes, then clears get_tracker's cache internally
             st.session_state["_tracker_msg"] = (ok, f"{sym}: {msg}")
             st.session_state["_tracker_clear_box"] = True
             st.rerun()   # fresh run: get_tracker() below will read the just-written state
 
     if pending:
         ok, text = pending
-        (st.success if ok else st.warning)(text)
+        _toast(text, ok)
     if at_cap:
         st.caption(f"That's the maximum of {TRACKER_MAX} \u2014 remove one below to add another.")
 
@@ -3432,7 +3434,8 @@ def render_tracker():
                 unsafe_allow_html=True)
 
     def _remove_now(sym):
-        ok, msg = remove_from_tracker(sym)
+        with st.spinner(f"Removing {sym}\u2026"):
+            ok, msg = remove_from_tracker(sym)
         st.session_state["_tracker_msg"] = (ok, f"{sym}: {msg}")
         st.rerun()
 
@@ -4035,6 +4038,18 @@ import json as _json
 import datetime as _dt
 
 _GH_API = "https://api.github.com"
+
+
+def _toast(msg, ok=True):
+    """Small, auto-dismissing action feedback (Streamlit's native toast) instead
+    of a persistent colored banner. Tries to request a ~5s duration; on a
+    Streamlit version that doesn't support the `duration` kwarg, falls back to
+    the plain call (Streamlit's own default auto-dismiss, ~4s)."""
+    icon = "\u2705" if ok else "\u26a0\ufe0f"
+    try:
+        st.toast(msg, icon=icon, duration=5)
+    except TypeError:
+        st.toast(msg, icon=icon)
 
 
 def _gh_configured():
@@ -5416,19 +5431,21 @@ def show_ticker(symbol):
         if _tracked:
             if st.button("\u2605", key=f"untrack_{symbol}",
                         help=f"Remove {symbol} from My Stock Tracker"):
-                ok, msg = remove_from_tracker(symbol)
+                with st.spinner("Removing\u2026"):
+                    ok, msg = remove_from_tracker(symbol)
                 st.session_state["_track_msg"] = (ok, msg)
                 st.rerun()
         else:
             if st.button("\u2606", key=f"track_{symbol}",
                         help=f"Track {symbol} in My Stock Tracker"):
-                ok, msg = add_to_tracker(symbol)
+                with st.spinner("Adding\u2026"):
+                    ok, msg = add_to_tracker(symbol)
                 st.session_state["_track_msg"] = (ok, msg)
                 st.rerun()
     _tmsg = st.session_state.pop("_track_msg", None)
     if _tmsg:
         _ok, _text = _tmsg
-        (st.success if _ok else st.warning)(_text)
+        _toast(_text, _ok)
 
     mode = st.radio("View mode", ["Guide Me", "Metrics"],
                     horizontal=True, key="detail_mode", label_visibility="collapsed")
