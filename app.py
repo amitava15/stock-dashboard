@@ -24,7 +24,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.11.2"
+APP_VERSION = "0.11.3"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ st.markdown("""
 
 :root{
   --ink:#23231E; --paper:#FCFBF8; --muted:#7A7970; --line:#E8E6DE;
-  --pos:#2F6B4F; --neg:#A24A38;
+  --pos:#2F6B4F; --neg:#A24A38; --warn:#B07A2E; --info:#3A5A78;
 }
 
 .stApp, [data-testid="stAppViewContainer"]{ background:var(--paper); }
@@ -82,6 +82,18 @@ h3, h4{ font-family:'Fraunces', Georgia, serif !important; font-weight:500 !impo
 
 [data-testid="stMetricDelta"]{ font-family:'IBM Plex Sans', sans-serif !important; font-weight:500; }
 [data-testid="stMetricLabel"] svg{ opacity:.55; }
+
+
+
+/* Subtle signal chips used under metrics. These are interpretation aids, not buy/sell signals. */
+.rt-chip{display:inline-block;margin:.18rem 0 .1rem;padding:.13rem .48rem;border-radius:999px;
+  font-family:'IBM Plex Sans',sans-serif;font-size:.66rem;font-weight:600;letter-spacing:.07em;
+  text-transform:uppercase;border:1px solid transparent;line-height:1.35}
+.rt-chip-good{color:var(--pos,#2F6B4F);background:rgba(47,107,79,.08);border-color:rgba(47,107,79,.22)}
+.rt-chip-risk{color:var(--neg,#A24A38);background:rgba(162,74,56,.08);border-color:rgba(162,74,56,.22)}
+.rt-chip-caution{color:var(--warn,#B07A2E);background:rgba(176,122,46,.10);border-color:rgba(176,122,46,.25)}
+.rt-chip-neutral{color:var(--muted,#7A7970);background:rgba(122,121,112,.08);border-color:rgba(122,121,112,.18)}
+.rt-chip-info{color:var(--info,#3A5A78);background:rgba(58,90,120,.08);border-color:rgba(58,90,120,.20)}
 
 /* Sidebar — soft, set apart with a hairline */
 [data-testid="stSidebar"]{ background:#F5F3EC; border-right:1px solid var(--line); }
@@ -949,13 +961,200 @@ def money_range(a, b):
     return f"{money(a)} – {money(b)}".replace("$", r"\$")
 
 
-def metric_tile(col, label, value, explainer_key, note=None):
-    """A metric with a small '?' tooltip (hover on desktop, tap on mobile)."""
+def _tone_color(tone):
+    return {"good": POS, "risk": NEG, "caution": WARN, "neutral": MUTED,
+            "info": INFO}.get(tone or "neutral", MUTED)
+
+
+def _chip(text, tone="neutral"):
+    """Small, quiet status label under a metric. Tone is an interpretation aid,
+    not a recommendation."""
+    if not text:
+        return
+    tone = tone if tone in {"good", "risk", "caution", "neutral", "info"} else "neutral"
+    st.markdown(f"<span class='rt-chip rt-chip-{tone}'>{text}</span>", unsafe_allow_html=True)
+
+
+def _colored(text, tone="neutral", weight=600):
+    return f"<span style='color:{_tone_color(tone)};font-weight:{weight}'>{text}</span>"
+
+
+def metric_tile(col, label, value, explainer_key, note=None, status=None, status_tone="neutral"):
+    """A metric with a small '?' tooltip and an optional color-coded status chip."""
     help_text = EXPLAINERS.get(explainer_key, "")
     if note:
         help_text = (help_text + "\n\n**This one:** " + note).strip()
     with col:
         st.metric(label, value, help=help_text or None)
+        if status:
+            _chip(status, status_tone)
+
+
+# ---------------------------------------------------------------------------
+# Signal helpers for restrained color-coding. These intentionally avoid turning
+# the app into a buy/sell terminal: green/red/amber only describe the metric's
+# condition in plain English.
+# ---------------------------------------------------------------------------
+def _sign_signal(v, pos="positive", neg="negative", flat="flat", extreme_warn=True):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if extreme_warn and abs(v) >= 300:
+        return "Extreme / verify", "caution"
+    if v > 5:
+        return pos, "good"
+    if v < -5:
+        return neg, "risk"
+    return flat, "neutral"
+
+
+def _margin_signal(v, gross=False):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v < 0:
+        return "Negative", "risk"
+    if gross:
+        if v >= 40:
+            return "Strong margin", "good"
+        if v < 20:
+            return "Thin margin", "caution"
+    else:
+        if v >= 15:
+            return "Strong margin", "good"
+        if v < 5:
+            return "Thin margin", "caution"
+    return "Normal range", "neutral"
+
+
+def _roe_signal(v):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v < 0:
+        return "Negative ROE", "risk"
+    if v >= 20:
+        return "High ROE", "good"
+    if v >= 10:
+        return "Healthy ROE", "good"
+    return "Low ROE", "caution"
+
+
+def _debt_signal(v):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v < 0:
+        return "Net cash / unusual", "info"
+    if v <= 0.5:
+        return "Low leverage", "good"
+    if v <= 1.5:
+        return "Moderate leverage", "neutral"
+    if v <= 2.5:
+        return "Elevated leverage", "caution"
+    return "High leverage", "risk"
+
+
+def _beta_signal(v):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v < 0.8:
+        return "Lower volatility", "good"
+    if v <= 1.3:
+        return "Market-like risk", "neutral"
+    if v <= 2.0:
+        return "High volatility", "caution"
+    return "Very high volatility", "risk"
+
+
+def _valuation_signal(v, kind):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if kind in {"pe", "forward_pe"}:
+        if v <= 0:
+            return "Loss / distorted", "risk"
+        if v < 15:
+            return "Lower multiple", "good"
+        if v <= 30:
+            return "Moderate multiple", "neutral"
+        if v <= 50:
+            return "Premium multiple", "caution"
+        return "Very high multiple", "risk"
+    if kind == "peg":
+        if v <= 0:
+            return "Distorted / verify", "caution"
+        if v < 1:
+            return "Growth-adjusted low", "good"
+        if v <= 2:
+            return "Reasonable range", "neutral"
+        return "Growth-adjusted high", "caution"
+    if kind == "ev":
+        if v <= 0:
+            return "Distorted / verify", "caution"
+        if v < 10:
+            return "Lower multiple", "good"
+        if v <= 15:
+            return "Moderate multiple", "neutral"
+        if v <= 25:
+            return "Premium multiple", "caution"
+        return "Very high multiple", "risk"
+    if kind == "ps":
+        if v < 3:
+            return "Lower sales multiple", "good"
+        if v <= 7:
+            return "Moderate sales multiple", "neutral"
+        if v <= 12:
+            return "High sales multiple", "caution"
+        return "Very high sales multiple", "risk"
+    if kind == "fcf_yield":
+        if v < 0:
+            return "Negative cash yield", "risk"
+        if v < 2:
+            return "Low cash yield", "caution"
+        if v >= 5:
+            return "Strong cash yield", "good"
+        return "Moderate cash yield", "neutral"
+    return None, "neutral"
+
+
+def _ma_signal(is_above):
+    if is_above is None:
+        return None, "neutral"
+    return ("Above trend", "good") if is_above else ("Below trend", "risk")
+
+
+def _rsi_signal(v):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v >= 70:
+        return "Overbought / stretched", "caution"
+    if v <= 30:
+        return "Oversold / weak", "caution"
+    if 45 <= v <= 55:
+        return "Neutral", "neutral"
+    return ("Positive momentum", "good") if v > 55 else ("Soft momentum", "caution")
+
+
+def _volume_signal(v):
+    v = to_float(v)
+    if v is None:
+        return None, "neutral"
+    if v >= 1.5:
+        return "High attention", "caution"
+    if v >= 1.2:
+        return "Elevated volume", "info"
+    if v < 0.8:
+        return "Light volume", "neutral"
+    return "Normal volume", "neutral"
+
+
+def _history_tone(word):
+    # For valuation multiples, lower than history is not automatically "good",
+    # but it is favorable relative to the company's own past; above is caution.
+    return {"above": "caution", "below": "good", "near": "neutral"}.get(word, "neutral")
 
 
 def section(title, kicker=""):
@@ -967,6 +1166,7 @@ def section(title, kicker=""):
 # Editorial palette (kept in sync with the CSS block up top)
 INK, PAPER, MUTED, LINE = "#23231E", "#FCFBF8", "#7A7970", "#E8E6DE"
 POS, NEG = "#2F6B4F", "#A24A38"
+WARN, INFO = "#B07A2E", "#3A5A78"
 RANGE_DAYS = {"1W": 7, "1M": 30, "6M": 182, "1Y": 365, "5Y": 365 * 5}
 RANGE_WORDS = {"1W": "over the past week", "1M": "over the past month",
                "6M": "over the past 6 months", "1Y": "over the past year",
@@ -1299,13 +1499,19 @@ def render_valuation_growth(symbol):
 
     _subgroup("Current Valuation")
     c = st.columns(3)
-    metric_tile(c[0], "P/E (TTM)", num(cur.get("pe")), "pe")
-    metric_tile(c[1], "Forward P/E", num(cur.get("forward_pe")), "forward_pe")
-    metric_tile(c[2], "PEG", num(cur.get("peg")), "peg")
+    _s, _t = _valuation_signal(cur.get("pe"), "pe")
+    metric_tile(c[0], "P/E (TTM)", num(cur.get("pe")), "pe", status=_s, status_tone=_t)
+    _s, _t = _valuation_signal(cur.get("forward_pe"), "forward_pe")
+    metric_tile(c[1], "Forward P/E", num(cur.get("forward_pe")), "forward_pe", status=_s, status_tone=_t)
+    _s, _t = _valuation_signal(cur.get("peg"), "peg")
+    metric_tile(c[2], "PEG", num(cur.get("peg")), "peg", status=_s, status_tone=_t)
     c = st.columns(3)
-    metric_tile(c[0], "EV / EBITDA", num(cur.get("ev_ebitda")), "ev_ebitda")
-    metric_tile(c[1], "Price / Sales", num(cur.get("ps")), "price_sales")
-    metric_tile(c[2], "FCF Yield", pct(cur.get("fcf_yield")), "fcf_yield")
+    _s, _t = _valuation_signal(cur.get("ev_ebitda"), "ev")
+    metric_tile(c[0], "EV / EBITDA", num(cur.get("ev_ebitda")), "ev_ebitda", status=_s, status_tone=_t)
+    _s, _t = _valuation_signal(cur.get("ps"), "ps")
+    metric_tile(c[1], "Price / Sales", num(cur.get("ps")), "price_sales", status=_s, status_tone=_t)
+    _s, _t = _valuation_signal(cur.get("fcf_yield"), "fcf_yield")
+    metric_tile(c[2], "FCF Yield", pct(cur.get("fcf_yield")), "fcf_yield", status=_s, status_tone=_t)
 
     fe = get_forward_estimates(symbol, n=2)
     if fe["years"]:
@@ -1340,9 +1546,12 @@ def render_valuation_growth(symbol):
 
     _subgroup("Growth Context")
     c = st.columns(3)
-    metric_tile(c[0], "Revenue Growth (YoY)", pct(gro.get("revenue")), "revenue_growth")
-    metric_tile(c[1], "EPS Growth (YoY)", pct(gro.get("eps")), "eps_growth")
-    metric_tile(c[2], "FCF Growth (YoY)", pct(gro.get("fcf")), "fcf_growth")
+    _s, _t = _sign_signal(gro.get("revenue"), pos="Growing", neg="Shrinking", flat="Flat")
+    metric_tile(c[0], "Revenue Growth (YoY)", pct(gro.get("revenue")), "revenue_growth", status=_s, status_tone=_t)
+    _s, _t = _sign_signal(gro.get("eps"), pos="EPS growing", neg="EPS shrinking", flat="Flat", extreme_warn=True)
+    metric_tile(c[1], "EPS Growth (YoY)", pct(gro.get("eps")), "eps_growth", status=_s, status_tone=_t)
+    _s, _t = _sign_signal(gro.get("fcf"), pos="FCF growing", neg="FCF shrinking", flat="Flat", extreme_warn=True)
+    metric_tile(c[2], "FCF Growth (YoY)", pct(gro.get("fcf")), "fcf_growth", status=_s, status_tone=_t)
 
     _subgroup("Historical Context")
     c = st.columns(3)
@@ -1359,8 +1568,13 @@ def render_valuation_growth(symbol):
         with col:
             st.metric(f"{label} 5-yr median", num(med), help=EXPLAINERS.get(help_key))
             if now is not None:
-                tail = f" · trading **{word}**" if word else ""
-                st.caption(f"Now **{num(now)}**{tail}")
+                if word:
+                    st.markdown(
+                        f"<div style='color:{MUTED};font-size:.79rem;margin-top:-.55rem;line-height:1.5'>"
+                        f"Now <b>{num(now)}</b> · trading {_colored(word, _history_tone(word))}</div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.caption(f"Now **{num(now)}**")
             else:
                 st.caption("Current value unavailable")
 
@@ -1442,7 +1656,8 @@ def render_analyst(symbol):
             st.metric("Average", money(tg.get("avg")))
         with c[2]:
             st.metric("High", money(tg.get("high")))
-        metric_tile(c[3], "Implied Upside", pct(tg.get("upside")), "implied_upside")
+        _s, _t = _sign_signal(tg.get("upside"), pos="Upside to target", neg="Below target", flat="Near target", extreme_warn=False)
+        metric_tile(c[3], "Implied Upside", pct(tg.get("upside")), "implied_upside", status=_s, status_tone=_t)
 
     if fw.get("eps") is not None or fw.get("revenue") is not None:
         _subgroup("Forward Estimates")
@@ -1494,11 +1709,19 @@ def render_earnings(symbol):
         with c[0]:
             st.metric("EPS", money(last.get("eps_actual")))
             beat = _beat_str(last.get("eps_surprise"))
-            st.caption(f"est. {money(last.get('eps_est'))}" + (f" · **{beat}**" if beat else ""))
+            if beat:
+                tone = "good" if to_float(last.get("eps_surprise")) >= 0 else "risk"
+                st.markdown(f"<div style='color:{MUTED};font-size:.79rem'>est. {money(last.get('eps_est'))} · {_colored(beat, tone)}</div>", unsafe_allow_html=True)
+            else:
+                st.caption(f"est. {money(last.get('eps_est'))}")
         with c[1]:
             st.metric("Revenue", big_money(last.get("rev_actual")))
             beat = _beat_str(last.get("rev_surprise"))
-            st.caption(f"est. {big_money(last.get('rev_est'))}" + (f" · **{beat}**" if beat else ""))
+            if beat:
+                tone = "good" if to_float(last.get("rev_surprise")) >= 0 else "risk"
+                st.markdown(f"<div style='color:{MUTED};font-size:.79rem'>est. {big_money(last.get('rev_est'))} · {_colored(beat, tone)}</div>", unsafe_allow_html=True)
+            else:
+                st.caption(f"est. {big_money(last.get('rev_est'))}")
 
     _subgroup("SEC Filings")
     if cik:
@@ -1592,20 +1815,24 @@ def render_technicals(symbol):
         a = t.get("above_50")
         st.metric("vs 50-day MA", ("Above" if a else "Below") if a is not None else "N/A",
                   help=EXPLAINERS.get("ma_50"))
+        _s, _t = _ma_signal(a)
+        _chip(_s, _t)
         if t.get("ma50") is not None:
             st.caption(f"50-day avg {money(t['ma50'])}")
     with c[1]:
         a = t.get("above_200")
         st.metric("vs 200-day MA", ("Above" if a else "Below") if a is not None else "N/A",
                   help=EXPLAINERS.get("ma_200"))
+        _s, _t = _ma_signal(a)
+        _chip(_s, _t)
         if t.get("ma200") is not None:
             st.caption(f"200-day avg {money(t['ma200'])}")
     with c[2]:
         rsi = t.get("rsi")
         st.metric("RSI (14-day)", num(rsi, 0) if rsi is not None else "N/A",
                   help=EXPLAINERS.get("rsi"))
-        if rsi is not None:
-            st.caption("overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral")
+        _s, _t = _rsi_signal(rsi)
+        _chip(_s, _t)
 
     c = st.columns(3)
     metric_tile(c[0], "From 52-wk High", pct(t.get("dist_high")), "dist_high")
@@ -1614,6 +1841,8 @@ def render_technicals(symbol):
         vr = t.get("vol_ratio")
         st.metric("Volume vs Avg", f"{vr:,.2f}×" if vr is not None else "N/A",
                   help=EXPLAINERS.get("vol_ratio"))
+        _s, _t = _volume_signal(vr)
+        _chip(_s, _t)
 
     st.caption(_technicals_read(t))
 
@@ -3192,9 +3421,9 @@ def render_industry_benchmark(symbol):
 
             if tgt is not None and p25 is not None and p75 is not None:
                 if tgt > p75:
-                    pos, pcol = "above peer range", (POS if row["higher"] else NEG)
+                    pos, pcol = "above peer range", (POS if row["higher"] else WARN)
                 elif tgt < p25:
-                    pos, pcol = "below peer range", (NEG if row["higher"] else POS)
+                    pos, pcol = "below peer range", (WARN if row["higher"] else POS)
                 else:
                     pos, pcol = "within peer range", MUTED
             else:
@@ -3279,10 +3508,14 @@ def show_ticker(symbol):
 
         section("Financial Health", "how it's doing")
         c1, c2, c3, c4 = st.columns(4)
-        metric_tile(c1, "Net Margin", pct(metrics.get("net_margin_pct")), "net_margin")
-        metric_tile(c2, "Gross Margin", pct(metrics.get("gross_margin_pct")), "gross_margin")
-        metric_tile(c3, "Debt / Equity", num(metrics.get("debt_to_equity")), "debt_equity")
-        metric_tile(c4, "Return on Equity", pct(metrics.get("roe_pct")), "roe")
+        _s, _t = _margin_signal(metrics.get("net_margin_pct"), gross=False)
+        metric_tile(c1, "Net Margin", pct(metrics.get("net_margin_pct")), "net_margin", status=_s, status_tone=_t)
+        _s, _t = _margin_signal(metrics.get("gross_margin_pct"), gross=True)
+        metric_tile(c2, "Gross Margin", pct(metrics.get("gross_margin_pct")), "gross_margin", status=_s, status_tone=_t)
+        _s, _t = _debt_signal(metrics.get("debt_to_equity"))
+        metric_tile(c3, "Debt / Equity", num(metrics.get("debt_to_equity")), "debt_equity", status=_s, status_tone=_t)
+        _s, _t = _roe_signal(metrics.get("roe_pct"))
+        metric_tile(c4, "Return on Equity", pct(metrics.get("roe_pct")), "roe", status=_s, status_tone=_t)
 
     # ---------------- VALUATION ----------------
     with tab_valuation:
@@ -3302,7 +3535,8 @@ def show_ticker(symbol):
 
         section("Risk", "what could move it")
         c1, c2, c3 = st.columns(3)
-        metric_tile(c1, "Beta", num(metrics.get("beta")), "beta")
+        _s, _t = _beta_signal(metrics.get("beta"))
+        metric_tile(c1, "Beta", num(metrics.get("beta")), "beta", status=_s, status_tone=_t)
         with c2:
             st.metric("Day Range", money_range(quote.get("day_low"), quote.get("day_high")))
         with c3:
@@ -3676,6 +3910,7 @@ else:
     show_movers(view.get("mover", "gainers"))
 
 st.markdown("---")
+st.caption("Signal colors: green = favorable/improving, amber = caution/stretched, red = risk/deteriorating, blue = informational, gray = neutral. Colors explain the metric; they are not buy/sell signals.")
 st.caption(
     "📚 Educational tool, not financial advice. Data from Financial Modeling Prep, "
     "and may be delayed. Metrics and 'healthy ranges' are general guidance — compare within a "
