@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.18.1"
+APP_VERSION = "0.18.2"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -4813,13 +4813,15 @@ def render_guided(symbol, quote, profile, metrics):
     surprise = ((ea_a - ea_e) / abs(ea_e) * 100) if (ea_a is not None and ea_e not in (None, 0)) else None
     is_beat = (ea_a > ea_e) if (ea_a is not None and ea_e is not None) else None
     loss_q = ea_a is not None and ea_a < 0
-    beat_txt = "\u2014"
-    if ea_a is not None:
-        beat_txt = f"{money(ea_a)} vs {money(ea_e)} est"
-        if surprise is not None:
-            beat_txt += f" \u00b7 {'beat' if is_beat else 'missed'} by {abs(surprise):.0f}%"
+    main_txt = f"{money(ea_a)} vs {money(ea_e)} est" if ea_a is not None else "\u2014"
     with c[0]:
-        st.metric("Last EPS (actual vs est.)", beat_txt)
+        st.metric("Last EPS (actual vs est.)", main_txt)
+        if surprise is not None:
+            verb = "beat" if is_beat else "missed"
+            tone = POS if is_beat else NEG
+            st.markdown(f"<div style='color:{tone};font-size:.79rem;font-weight:600;"
+                        f"margin-top:-.55rem'>{verb} by {abs(surprise):.0f}%</div>",
+                        unsafe_allow_html=True)
     with c[1]:
         st.metric("Next earnings", str(nxt.get("date") or "\u2014"))
     with c[2]:
@@ -5645,10 +5647,4 @@ else:
     show_movers(view.get("mover", "gainers"))
 
 st.markdown("---")
-st.caption("Signal colors: green = favorable/improving, amber = caution/stretched, red = risk/deteriorating, blue = informational, gray = neutral. Colors explain the metric; they are not buy/sell signals.")
-st.caption(
-    "📚 Educational tool, not financial advice. Data from Financial Modeling Prep, "
-    "and may be delayed. Metrics and 'healthy ranges' are general guidance — compare within a "
-    "company's own industry, and make your own decisions."
-)
-st.caption(f"📦 Version {APP_VERSION} · built {APP_BUILD}")
+st.caption(f"\U0001F4E6 Version {APP_VERSION} · built {APP_BUILD}")
