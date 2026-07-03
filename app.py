@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.19.0"
+APP_VERSION = "0.19.1"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3335,10 +3335,17 @@ def render_top_stocks():
 # ===========================================================================
 
 def _tracker_add():
+    import time as _time2
     q = st.session_state.get("tracker_add_box", "").strip()
     st.session_state.tracker_add_box = ""
     if not q:
         return
+    now = _time2.time()
+    last_q, last_t = st.session_state.get("_tracker_last_add", (None, 0))
+    if q.upper() == (last_q or "").upper() and (now - last_t) < 3:
+        return   # the same text fired twice within 3s (e.g. Enter + a button click on the
+                 # same submission) \u2014 treat as one event, not two separate adds
+    st.session_state["_tracker_last_add"] = (q, now)
     sym, _name = _resolve_symbol(q)
     if sym:
         ok, msg = add_to_tracker(sym)
@@ -4036,16 +4043,34 @@ def _gh_put_file(path, data, sha=None, message="update"):
     if not _gh_configured():
         return False
     repo = st.secrets.get("GITHUB_DATA_REPO")
-    body = {"message": message,
-            "content": base64.b64encode(_json.dumps(data, indent=2).encode("utf-8")).decode("ascii")}
-    if sha:
-        body["sha"] = sha
-    try:
-        r = requests.put(f"{_GH_API}/repos/{repo}/contents/{path}", headers=_gh_headers(),
-                         json=body, timeout=15)
-        return r.status_code in (200, 201)
-    except Exception:  # noqa: BLE001
-        return False
+
+    def attempt(use_sha):
+        body = {"message": message,
+                "content": base64.b64encode(_json.dumps(data, indent=2).encode("utf-8")).decode("ascii")}
+        if use_sha:
+            body["sha"] = use_sha
+        try:
+            return requests.put(f"{_GH_API}/repos/{repo}/contents/{path}", headers=_gh_headers(),
+                                json=body, timeout=15)
+        except Exception:  # noqa: BLE001
+            return None
+
+    r = attempt(sha)
+    if r is not None and r.status_code in (200, 201):
+        return True
+    if r is not None and r.status_code in (409, 422):
+        # Stale sha — something else touched the file between our read and this
+        # write (e.g. a near-simultaneous add/remove). Refetch the current sha
+        # and retry once, rather than silently failing the whole save.
+        try:
+            fresh = requests.get(f"{_GH_API}/repos/{repo}/contents/{path}",
+                                 headers=_gh_headers(), timeout=15)
+            fresh_sha = fresh.json().get("sha") if fresh.status_code == 200 else None
+        except Exception:  # noqa: BLE001
+            fresh_sha = None
+        r2 = attempt(fresh_sha)
+        return bool(r2 is not None and r2.status_code in (200, 201))
+    return False
 
 
 # ------------------------- saved research notes -------------------------
