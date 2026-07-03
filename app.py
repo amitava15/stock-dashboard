@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.20.1"
+APP_VERSION = "0.21.0"
 APP_BUILD = "2026-07-02"
 
 # ---------------------------------------------------------------------------
@@ -3013,11 +3013,11 @@ def render_pdf_fab(symbol):
 # while it scans ~500 names, then it's instant for the rest of the day.
 # ===========================================================================
 
-# S&P 500 constituents — snapshot as of 2026-07-02. Index membership drifts a
-# few times a year, so refresh this list periodically. Unknown/delisted tickers
-# simply return no history and are skipped, so a slightly stale list degrades
-# quietly rather than breaking the scan.
-SP500 = (
+# S&P 500 constituents — FALLBACK snapshot as of 2026-07-02, used only if the
+# live pull below fails or isn't available on the current FMP plan. Unknown/
+# delisted tickers simply return no history and are skipped, so even a stale
+# fallback degrades quietly rather than breaking the scan.
+SP500_FALLBACK = (
     "MMM", "AOS", "ABT", "ABBV", "ACN", "ADBE", "AMD", "AES", "AFL", "A", "APD", "ABNB", "AKAM",
     "ALB", "ARE", "ALGN", "ALLE", "LNT", "ALL", "GOOGL", "GOOG", "MO", "AMZN", "AMCR", "AEE", "AEP",
     "AXP", "AIG", "AMT", "AWK", "AMP", "AME", "AMGN", "APH", "ADI", "ANSS", "AON", "APA", "AAPL",
@@ -3056,6 +3056,46 @@ SP500 = (
     "WRB", "GWW", "WAB", "WBA", "WMT", "DIS", "WBD", "WM", "WAT", "WEC", "WFC", "WELL", "WST", "WDC",
     "WY", "WMB", "WTW", "WYNN", "XEL", "XYL", "YUM", "ZBRA", "ZBH", "ZTS",
 )
+
+
+def _sp500_storage_path(date_str):
+    return f"sp500/constituents_{date_str}.json"
+
+
+def _load_sp500_from_storage(date_str):
+    doc, _ = _gh_get_file(_sp500_storage_path(date_str))
+    if not doc or "symbols" not in doc:
+        return None
+    return tuple(doc["symbols"])
+
+
+def _save_sp500_to_storage(date_str, symbols):
+    if not _gh_configured():
+        return False
+    path = _sp500_storage_path(date_str)
+    _existing, sha = _gh_get_file(path)
+    return _gh_put_file(path, {"date": date_str, "symbols": list(symbols)}, sha,
+                        message=f"Save S&P 500 constituents for {date_str}")
+
+
+@st.cache_data(ttl=21600, show_spinner=False)   # ~6h in-process; GitHub persistence below
+def get_sp500_constituents(date_str):
+    """Live S&P 500 membership, pulled once per day and persisted to the GitHub
+    data repo \u2014 so every device/session reads the same saved list rather than
+    each one re-pulling, and a cold app restart reuses today's already-fetched
+    list instead of hitting FMP again. Falls back to a hardcoded snapshot if
+    the live endpoint isn't available on the current FMP plan, returns an
+    implausibly short list, or the pull fails for any other reason \u2014 Top
+    Stocks should never break because this one call had a bad day."""
+    stored = _load_sp500_from_storage(date_str)
+    if stored is not None and len(stored) >= 400:
+        return stored
+    rows = _fmp_statement("sp500-constituent")
+    symbols = tuple(sorted({(pick(r, "symbol") or "").upper() for r in rows if pick(r, "symbol")}))
+    if len(symbols) < 400:   # a real pull returns ~500; anything far short signals a bad,
+        return SP500_FALLBACK   # empty, or plan-gated response \u2014 don't trust a partial universe
+    _save_sp500_to_storage(date_str, symbols)   # best-effort; a failed save just means
+    return symbols                              # tomorrow's first pull tries again
 
 # A small watchlist that earns a Focus Priority bonus — names you want surfaced
 # even on a quieter day. Tune freely (these are just examples).
@@ -3280,7 +3320,7 @@ def render_top_stocks():
                "scans ~500 names and takes a minute or two; after that it's cached and instant.")
     today = _dt.date.today()
     with st.spinner("Scanning the S&P 500 for today's trends\u2026  (first load of the day only)"):
-        ranked, scanned = _get_daily_scan(today.isoformat(), SP500, "top")
+        ranked, scanned = _get_daily_scan(today.isoformat(), get_sp500_constituents(today.isoformat()), "top")
 
     if not ranked:
         st.info("Nothing to show yet. If this is the very first load it may still be warming up, or "
