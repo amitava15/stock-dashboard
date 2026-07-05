@@ -25,8 +25,8 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.23.0"
-APP_BUILD = "2026-07-02"
+APP_VERSION = "0.24.0"
+APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
 # Styling: quiet editorial "tasting card" — serif values like menu prices,
@@ -3337,6 +3337,16 @@ def _delta_row_html(m):
     return f"<div style='display:flex;flex-wrap:wrap;gap:1rem;margin:.3rem 0'>{row}</div>"
 
 
+def _sector_breadcrumb_html(sector):
+    """Small uppercase sector label shown above each stock row in Top Stocks
+    and the Tracker. Falls back to nothing if a symbol isn't in the sector
+    universe map (e.g. a small-cap below the ~$2B screener threshold)."""
+    if not sector or sector == "Other":
+        return ""
+    return (f"<div style='font-size:.62rem;letter-spacing:.09em;color:{MUTED};"
+            f"text-transform:uppercase;margin-bottom:.1rem'>{sector}</div>")
+
+
 def _focus_badge_html(score):
     text, color = _focus_label(score)
     return (f"<div style='margin:.2rem 0 .15rem'><span style='font-size:.6rem;letter-spacing:.09em;"
@@ -3404,7 +3414,8 @@ def render_top_stocks():
             _px = m.get("price")
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
                     f"${_px:,.2f}</span>") if _px is not None else ""
-            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
+            st.markdown(f"{_sector_breadcrumb_html(r['sector'])}"
+                        f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
                         f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>"
                         f"{_focus_badge_html(r['score'])}"
                         f"{_delta_row_html(m)}",
@@ -3512,10 +3523,12 @@ def render_tracker():
         ranked, _scanned = _get_daily_scan(today.isoformat(), symbols, "tracker")
 
     ranked_syms = {r["symbol"] for r in ranked}
+    umap = get_universe_map()
     for r in ranked:
         if "name" not in r:
             r["name"] = get_company_profile(r["symbol"]).get("name") or r["symbol"]
             r["why"] = _why_explore(r["m"], r["trend"])
+        r["sector"] = umap.get(r["symbol"], {}).get("sector") or "Other"
     ranked.sort(key=lambda r: r["score"], reverse=True)
 
     # Any tracked symbol without enough price history still needs to show up \u2014
@@ -3529,7 +3542,8 @@ def render_tracker():
             q = get_quote(sym)
             nm = get_company_profile(sym).get("name") if q else None
             thin.append({"symbol": sym, "name": nm or sym, "price": q.get("price"),
-                        "invalid": not q})
+                        "invalid": not q,
+                        "sector": umap.get(sym, {}).get("sector") or "Other"})
 
     st.caption(f"Tracking {len(entries)} of {TRACKER_MAX}.")
     st.markdown(f"<hr style='border:none;border-top:1px solid {LINE};margin:.4rem 0 .8rem'>",
@@ -3549,7 +3563,8 @@ def render_tracker():
             _pxs = (f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>"
                     f"${_px:,.2f}</span>") if _px is not None else ""
             added = added_by_sym.get(r["symbol"], "")
-            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
+            st.markdown(f"{_sector_breadcrumb_html(r['sector'])}"
+                        f"<div style='font-weight:600;font-size:1.02rem'>{i}. {r['symbol']}{_pxs}</div>"
                         f"<div style='color:{MUTED};font-size:.8rem'>{r['name']}</div>"
                         f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
                         f"{added or '\u2014'}</div>"
@@ -3577,7 +3592,8 @@ def render_tracker():
         with c[0]:
             _pxs = f" <span style='color:{MUTED};font-weight:400;font-size:.88rem'>${t['price']:,.2f}</span>" \
                 if t.get("price") is not None else ""
-            st.markdown(f"<div style='font-weight:600;font-size:1.02rem'>{t['symbol']}{_pxs}</div>"
+            st.markdown(f"{_sector_breadcrumb_html(t.get('sector'))}"
+                        f"<div style='font-weight:600;font-size:1.02rem'>{t['symbol']}{_pxs}</div>"
                         f"<div style='color:{MUTED};font-size:.8rem'>{t['name']}</div>"
                         f"<div style='color:{MUTED};font-size:.72rem;margin-top:.1rem'>Tracked since "
                         f"{added_by_sym.get(t['symbol'], '') or '\u2014'}</div>", unsafe_allow_html=True)
@@ -6111,7 +6127,7 @@ def _view_tracker():
 
 # on_click callbacks (below) run at the start of the rerun, before this body,
 # so `view` already reflects the button the person just clicked — no stale state.
-view = st.session_state.get("view", {"kind": "movers", "mover": "gainers"})
+view = st.session_state.get("view", {"kind": "top"})
 active_mover = view.get("mover") if view.get("kind") == "movers" else None
 on_compare = view.get("kind") == "compare"
 
