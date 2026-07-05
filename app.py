@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.24.0"
+APP_VERSION = "0.25.0"
 APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
@@ -2706,8 +2706,71 @@ def _pdf_escape(text):
             .replace(">", "&gt;"))
 
 
+def _pdf_mdclean(s):
+    """Strip markdown emphasis markers and escape for reportlab Paragraphs.
+    Shared by AI Analysis, Context, Offline Research, and the saved Research
+    Report sections \u2014 all of which render loosely-markdown AI-origin text."""
+    import re as _re
+    s = str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = _re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = _re.sub(r"__(.+?)__", r"\1", s)
+    s = _re.sub(r"\*(.+?)\*", r"\1", s)
+    return s.strip()
+
+
+def _pdf_markdown_flowables(text, S):
+    """A block of loosely-markdown text (headers via '#', plain paragraphs)
+    rendered as reportlab flowables."""
+    out = []
+    for para in str(text or "").split("\n"):
+        p = para.strip()
+        if not p:
+            continue
+        if p.startswith("#"):
+            out.append(Paragraph(_pdf_mdclean(p.lstrip("# ").strip()), S["ai_h"]))
+        else:
+            out.append(Paragraph(_pdf_mdclean(p), S["ai_body"]))
+            out.append(Spacer(1, 3))
+    return out
+
+
+def _pdf_context_block(res, S):
+    """One Context result (live-generated or saved/pasted) as PDF flowables,
+    mirroring _render_context_card's structure in the live app."""
+    out = []
+    if not res or res.get("error"):
+        return out
+    if res.get("_unparsed"):
+        out += _pdf_markdown_flowables(res.get("raw", ""), S)
+        return out
+    what = res.get("what_changed") or "No clear recent catalyst was found."
+    out.append(Paragraph("WHAT CHANGED", S["subg"]))
+    out.append(Paragraph(_pdf_mdclean(what), S["body"]))
+    for key in ("primary_catalyst", "secondary_catalyst"):
+        if res.get(key):
+            out.append(Paragraph(_pdf_mdclean(res[key]), S["note"]))
+    sentence = _ctx_materiality_sentence(res)
+    if sentence:
+        out.append(Paragraph(_pdf_mdclean(sentence), S["body"]))
+    if res.get("why_it_matters"):
+        out.append(Paragraph(_pdf_mdclean("Why it matters: " + res["why_it_matters"]), S["body"]))
+    if res.get("investor_question"):
+        out.append(Paragraph(_pdf_mdclean(res["investor_question"]), S["note"]))
+    if res.get("caveat"):
+        out.append(Paragraph(_pdf_mdclean("Caveat: " + res["caveat"]), S["note"]))
+    cites = res.get("citations") or []
+    if cites:
+        out.append(Paragraph(_pdf_mdclean("Sources: " + "; ".join(c.get("title", "") for c in cites[:6])), S["note"]))
+    filings = res.get("filings") or []
+    if filings:
+        out.append(Paragraph(_pdf_mdclean("Filings: " + "; ".join(
+            f"{f.get('form')} ({f.get('date')})" for f in filings[:6])), S["note"]))
+    return out
+
+
 def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
-                quarterly=None, forward=None, benchmark=None, quality=None):
+                quarterly=None, forward=None, benchmark=None, quality=None,
+                context=None, offline_notes=None, research_report=None):
     _pdf_fonts()
     S = _pdf_styles()
     W, H = _LETTER
@@ -2915,25 +2978,43 @@ def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn,
 
     if ai_text:
         story += _pdf_section("AI Analysis", "the whole picture, in plain English", S)
-        import re as _re
-
-        def _mdclean(s):
-            s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            s = _re.sub(r"\*\*(.+?)\*\*", r"\1", s)   # bold markers
-            s = _re.sub(r"__(.+?)__", r"\1", s)
-            s = _re.sub(r"\*(.+?)\*", r"\1", s)        # italic markers (no italics)
-            return s.strip()
-
-        for para in str(ai_text).split("\n"):
-            p = para.strip()
-            if not p:
-                continue
-            if p.startswith("#"):
-                story.append(Paragraph(_mdclean(p.lstrip("# ").strip()), S["ai_h"]))
-            else:
-                story.append(Paragraph(_mdclean(p), S["ai_body"]))
-                story.append(Spacer(1, 3))
+        story += _pdf_markdown_flowables(ai_text, S)
         story.append(Paragraph("AI-generated and may contain errors; verify against primary sources. Not a recommendation.", S["note"]))
+
+    if context:
+        story += _pdf_section("Context", "recent news & filings", S)
+        story += _pdf_context_block(context, S)
+        story.append(Paragraph("Context is aggregated from cited sources \u2014 not a recommendation.", S["note"]))
+
+    offline_notes = offline_notes or []
+    if offline_notes:
+        story += _pdf_section("Your Offline AI Research", "saved research notes", S)
+        shown = offline_notes[:10]   # keep the PDF a reasonable length
+        for n in shown:
+            when = (n.get("saved_at") or "")[:10]
+            kind = n.get("kind") or "note"
+            label = "Generated in-app" if kind == "context" else "Pasted from offline AI"
+            story.append(Paragraph(f"{label} \u00b7 saved {when}", S["subg"]))
+            data = n.get("data") or {}
+            if kind == "context":
+                story += _pdf_context_block(data, S)
+            elif data.get("raw"):
+                parsed = _parse_context_markdown(data["raw"])
+                if parsed.get("_unparsed"):
+                    story += _pdf_markdown_flowables(parsed.get("raw", "")[:3000], S)
+                else:
+                    story += _pdf_context_block(parsed, S)
+            story.append(Spacer(1, 6))
+        if len(offline_notes) > 10:
+            story.append(Paragraph(f"\u2026and {len(offline_notes) - 10} more saved entries not shown here to "
+                                   "keep this report readable \u2014 open the app to see the full history.",
+                                   S["note"]))
+
+    if research_report and research_report.get("raw"):
+        story += _pdf_section("Saved Research Report", "your saved research prompt output", S)
+        saved_at = (research_report.get("saved_at") or "")[:10]
+        story.append(Paragraph(_pdf_mdclean(f"Saved {saved_at}"), S["note"]))
+        story += _pdf_markdown_flowables(research_report["raw"], S)
 
     if notes and notes.strip():
         story += _pdf_section("Your Notes", "your call", S)
@@ -2975,8 +3056,14 @@ def build_pdf_report(symbol):
         closes = None
     ai_text = st.session_state.get("ai_analysis", {}).get(symbol)
     notes = st.session_state.get(f"notes_{symbol}", "")
+    # Context is session-only (never GitHub-persisted) \u2014 only present if
+    # generated this session, same as the live app's Market-tab reuse.
+    context = get_cached_context(symbol)
+    offline_notes = get_saved_notes(symbol)
+    research_report = get_research_report(symbol)
     return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
-                       quarterly=quarterly, forward=forward, benchmark=benchmark, quality=quality)
+                       quarterly=quarterly, forward=forward, benchmark=benchmark, quality=quality,
+                       context=context, offline_notes=offline_notes, research_report=research_report)
 
 
 def render_pdf_fab(symbol):
@@ -2989,8 +3076,9 @@ def render_pdf_fab(symbol):
         return
     cache = st.session_state.setdefault("pdf_cache", {})
     if st.button("\U0001F4C4 PDF", key="pdf_fab_gen",
-                 help="Build a PDF of this stock — every tab, charts included. Generate the AI "
-                      "analysis and write your notes first if you want them in the report."):
+                 help="Build a PDF of this stock — every tab, charts, saved Context, saved research, "
+                      "and notes included. Generate/save what you want in first if you want it in "
+                      "the report."):
         with st.spinner("Building your report…"):
             try:
                 cache[symbol] = build_pdf_report(symbol)
