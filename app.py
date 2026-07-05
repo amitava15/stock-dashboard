@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.25.0"
+APP_VERSION = "0.26.0"
 APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
@@ -2768,9 +2768,33 @@ def _pdf_context_block(res, S):
     return out
 
 
+def _pdf_industry_context_block(res, S):
+    """Industry Context as PDF flowables \u2014 same fields as the app's
+    Industry Context card (trend/horizon/why-it-matters/what-to-watch)."""
+    out = []
+    if not res or res.get("error"):
+        return out
+    if res.get("_unparsed"):
+        out += _pdf_markdown_flowables(res.get("raw", ""), S)
+        return out
+    out.append(Paragraph(_pdf_mdclean(res.get("what_changed", "")), S["body"]))
+    trend, horizon = res.get("trend", ""), res.get("horizon", "")
+    if trend or horizon:
+        out.append(Paragraph(_pdf_mdclean(f"{trend} \u00b7 {horizon}"), S["note"]))
+    if res.get("why_it_matters"):
+        out.append(Paragraph(_pdf_mdclean("Why it matters: " + res["why_it_matters"]), S["body"]))
+    if res.get("what_to_watch"):
+        out.append(Paragraph(_pdf_mdclean("What to watch: " + res["what_to_watch"]), S["note"]))
+    cites = res.get("citations") or []
+    if cites:
+        out.append(Paragraph(_pdf_mdclean("Sources: " + "; ".join(c.get("title", "") for c in cites[:6])), S["note"]))
+    return out
+
+
 def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
                 quarterly=None, forward=None, benchmark=None, quality=None,
-                context=None, offline_notes=None, research_report=None):
+                context=None, industry_context=None, industry=None,
+                offline_notes=None, research_report=None):
     _pdf_fonts()
     S = _pdf_styles()
     W, H = _LETTER
@@ -2986,6 +3010,11 @@ def _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn,
         story += _pdf_context_block(context, S)
         story.append(Paragraph("Context is aggregated from cited sources \u2014 not a recommendation.", S["note"]))
 
+    if industry_context:
+        story += _pdf_section(f"Industry Context \u2014 {industry}", "what's happening across the industry", S)
+        story += _pdf_industry_context_block(industry_context, S)
+        story.append(Paragraph("Industry context is aggregated from cited sources \u2014 not a recommendation.", S["note"]))
+
     offline_notes = offline_notes or []
     if offline_notes:
         story += _pdf_section("Your Offline AI Research", "saved research notes", S)
@@ -3059,11 +3088,16 @@ def build_pdf_report(symbol):
     # Context is session-only (never GitHub-persisted) \u2014 only present if
     # generated this session, same as the live app's Market-tab reuse.
     context = get_cached_context(symbol)
+    # Industry Context IS GitHub-persisted (shared across the whole industry),
+    # so unlike company Context this reliably survives a fresh session/device.
+    industry = profile.get("industry")
+    industry_context = get_industry_context(industry, _dt.date.today().isoformat()) if industry else None
     offline_notes = get_saved_notes(symbol)
     research_report = get_research_report(symbol)
     return _pdf_render(symbol, quote, profile, metrics, traj, cash, val, analyst, earn, tech, closes, ai_text, notes,
                        quarterly=quarterly, forward=forward, benchmark=benchmark, quality=quality,
-                       context=context, offline_notes=offline_notes, research_report=research_report)
+                       context=context, industry_context=industry_context, industry=industry,
+                       offline_notes=offline_notes, research_report=research_report)
 
 
 def render_pdf_fab(symbol):
@@ -5088,6 +5122,128 @@ def generate_context(symbol, name, provider, day):
     return res
 
 
+# ------------------------- industry context (shared across a whole industry) -------------------------
+# Unlike company Context (per-symbol, session-only), this is cached ONE PER
+# INDUSTRY PER DAY and GitHub-persisted \u2014 so across e.g. 40 semiconductor
+# tickers, only the first stock visited each day triggers an AI call; every
+# other stock in that industry just reads the shared file for free.
+
+def _industry_slug(industry):
+    return re.sub(r"[^a-z0-9]+", "-", (industry or "unknown").lower()).strip("-") or "unknown"
+
+
+def get_industry_context(industry, date):
+    doc, _ = _gh_get_file(f"industry-news/{_industry_slug(industry)}_{date}.json")
+    return doc
+
+
+def save_industry_context(industry, date, payload):
+    path = f"industry-news/{_industry_slug(industry)}_{date}.json"
+    _existing, sha = _gh_get_file(path)
+    return _gh_put_file(path, payload, sha, message=f"Industry context for {industry} {date}")
+
+
+def _build_industry_context_prompt(industry, sector):
+    run_date = _dt.date.today().isoformat()
+    return f"""You are writing an "Industry Context" briefing for a personal stock research dashboard.
+
+Industry: {industry}
+Broader sector: {sector or industry}
+Run date: {run_date}
+
+Use web search to identify recent, material developments affecting companies broadly across this
+industry over the last 30\u201360 days \u2014 regulatory or policy changes, macroeconomic or commodity/input-cost
+trends, supply chain shifts, and notable competitive-landscape moves. Do NOT focus on any single company;
+this is about the industry as a whole, not one stock's news (that is covered elsewhere on this dashboard).
+
+Do NOT give buy/sell/hold advice, and do NOT recommend or name specific stocks to buy or avoid.
+
+Source priority:
+1. Government/regulatory sources and official trade-body releases
+2. Reputable financial news such as Reuters, AP, Bloomberg, CNBC, WSJ, Barron's, MarketWatch, Financial Times
+3. Established trade/industry publications
+
+Do not use low-quality blogs, broker marketing pages, promotional articles, SEO pages, anonymous posts, or
+generic stock-analysis summaries for material claims.
+
+Tone rules:
+- Keep the tone neutral and research-oriented, never promotional.
+- Do not use words like "exponential," "unparalleled," "massive," "guaranteed," "historic," or "dominant"
+  unless directly quoted from an official source.
+- Keep the text under 220 words.
+- If there is no clear industry-wide development, say so clearly rather than inventing one.
+
+Return exactly the following, and nothing else \u2014 no source list, no preamble or closing remarks:
+
+PORTAL_TEXT_START
+## WHAT'S HAPPENING IN {industry.upper() if industry else 'THIS INDUSTRY'}
+<2\u20134 sentences on the most notable recent industry-wide development(s)>
+
+**Trend:** <Tailwind / Headwind / Mixed / Neutral>
+**Time horizon:** <Near-term / Multi-quarter / Structural>
+
+### Why it matters for companies in this space
+<1\u20133 sentences>
+
+### What to watch
+<one forward-looking thing worth verifying>
+PORTAL_TEXT_END
+"""
+
+
+_IND_SECTION_RE = re.compile(
+    r"##\s*WHAT'?S HAPPENING IN.*?\n(?P<what>.*?)"
+    r"\*\*Trend:\*\*\s*(?P<trend>\w+)"
+    r".*?\*\*Time horizon:\*\*\s*(?P<horizon>[\w\s\-]+?)\n"
+    r".*?###\s*Why it matters for companies in this space\s*(?P<why>.*?)"
+    r"###\s*What to watch\s*(?P<watch>.*)",
+    re.S | re.I)
+
+
+def _parse_industry_context_markdown(text):
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[4:] if raw[:4].lower() == "markdown" else raw
+    portal = _extract_portal_text(raw)
+    m = _IND_SECTION_RE.search(portal)
+    if not m:
+        return {"_unparsed": True, "raw": raw}
+    d = {k: (v or "").strip() for k, v in m.groupdict().items()}
+    return {"what_changed": d["what"], "trend": d["trend"].title(), "horizon": d["horizon"].strip(),
+           "why_it_matters": d["why"], "what_to_watch": d["watch"]}
+
+
+@st.cache_data(ttl=43200, show_spinner=False)   # session-level cache; GitHub is the cross-session layer
+def _industry_context_via_provider(industry, sector, provider, day):
+    prompt = _build_industry_context_prompt(industry, sector)
+    if provider == "perplexity":
+        text, cites = _context_via_perplexity(prompt)
+    elif provider == "gemini":
+        text, cites = _context_via_gemini(prompt)
+    else:
+        return {"error": "No context provider configured."}
+    res = _parse_industry_context_markdown(text)
+    res["citations"] = _resolve_citations(cites)[:8]
+    return res
+
+
+def get_or_generate_industry_context(industry, sector, provider, day):
+    """Checks the GitHub-persisted cache first \u2014 only the FIRST stock in an
+    industry visited each day triggers an AI call; everyone else reads the
+    shared file for free, same cost-saving pattern as the daily scans."""
+    cached = get_industry_context(industry, day)
+    if cached:
+        return cached
+    try:
+        res = _industry_context_via_provider(industry, sector, provider, day)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+    if not res.get("error"):
+        save_industry_context(industry, day, res)
+    return res
+
+
 # ------------------------- rendering -------------------------
 
 def _ctx_materiality_sentence(res):
@@ -5330,6 +5486,73 @@ def render_context(symbol, name):
     _render_saved_notes(symbol, name)
 
 
+def _render_industry_context_card(res, industry):
+    if not res or res.get("error"):
+        if res and res.get("error"):
+            st.warning(f"Couldn't fetch industry context ({res['error']}).")
+        return
+    if res.get("_unparsed"):
+        st.markdown(res.get("raw", ""))
+        return
+    trend_color = {"Tailwind": POS, "Headwind": NEG}.get(res.get("trend"), MUTED)
+    st.markdown(
+        f"<div style='border:1px solid {LINE};border-radius:10px;padding:.9rem 1.1rem;"
+        f"margin:.3rem 0 .5rem;max-width:52rem'>"
+        f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
+        f"margin-bottom:.4rem'>What's happening in {industry}</div>"
+        f"<div style='font-size:.98rem;line-height:1.55;color:{INK};font-style:italic'>"
+        f"{res.get('what_changed', '')}</div>"
+        f"<div style='margin-top:.5rem;font-size:.85rem'>"
+        f"<span style='color:{trend_color};font-weight:600'>{res.get('trend', '')}</span>"
+        f"<span style='color:{MUTED}'> \u00b7 {res.get('horizon', '')}</span></div>"
+        f"</div>", unsafe_allow_html=True)
+    if res.get("why_it_matters"):
+        st.markdown(f"<div style='font-size:.95rem;line-height:1.6;color:{INK};margin:.2rem 0;"
+                    f"max-width:52rem'>Why it matters: {res['why_it_matters']}</div>",
+                    unsafe_allow_html=True)
+    if res.get("what_to_watch"):
+        st.markdown(f"<div style='font-size:.85rem;color:{MUTED};margin-top:.3rem'>"
+                    f"What to watch: {res['what_to_watch']}</div>", unsafe_allow_html=True)
+    cites = res.get("citations") or []
+    if cites:
+        with st.expander("Sources reviewed", expanded=False):
+            for c in cites:
+                st.markdown(f"- [{c['title']}]({c['url']})")
+    st.caption("Industry context is aggregated from cited sources \u2014 not a recommendation.")
+
+
+def render_industry_context(industry, sector):
+    """Collapsed-by-default section, separate from company Context \u2014
+    covers regulatory/macro/competitive developments across the whole
+    industry rather than anything specific to one stock."""
+    if not industry:
+        return
+    slug = _industry_slug(industry)
+    today = _dt.date.today().isoformat()
+    with st.expander(f"Industry Context \u2014 {industry}", expanded=False):
+        cached = get_industry_context(industry, today)
+        if cached:
+            _render_industry_context_card(cached, industry)
+            return
+        provider = _context_provider()
+        st.caption(f"Recent regulatory, macro, and competitive developments across {industry} \u2014 "
+                   "shared across every stock in this industry, refreshed once a day.")
+        if provider is None:
+            st.caption("Add a `PERPLEXITY_API_KEY` or `GEMINI_API_KEY` in Streamlit secrets to enable "
+                       "this in-app, or copy the prompt below into any AI for free.")
+            st.code(_build_industry_context_prompt(industry, sector), language="markdown")
+            return
+        if st.button("Generate industry context", key=f"indctx_{slug}"):
+            if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
+                st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
+                           "Reload to reset.")
+            else:
+                st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+                with st.spinner(f"Reading recent {industry} developments\u2026"):
+                    get_or_generate_industry_context(industry, sector, provider, today)
+                st.rerun()   # fresh run re-reads the now-saved GitHub cache above
+
+
 def get_cached_context(symbol):
     """For reuse elsewhere (e.g. Market tab): only returns context already
     generated this session via Guide Me \u2014 never triggers a new API call."""
@@ -5466,6 +5689,7 @@ def render_guided(symbol, quote, profile, metrics):
             f"estimates for the next report ({nxt.get('date')}) are drifting up or down heading in. "
             "Rising estimates into a print is a stronger signal than the beat itself.")
     render_context(sym, name)
+    render_industry_context(profile.get("industry"), profile.get("sector"))
     _handoff("A good quarter only matters if the business behind it is actually getting stronger \u2014 "
              "so next, the trajectory.")
 
@@ -5903,6 +6127,7 @@ def show_ticker(symbol):
             if st.button("Go generate it in Guide Me", key=f"ctx_jump_{symbol}"):
                 st.session_state["detail_mode"] = "Guide Me"
                 st.rerun()
+        render_industry_context(profile.get("industry"), profile.get("sector"))
 
         section("Analyst Expectations", "what the market already expects")
         render_analyst(symbol)
