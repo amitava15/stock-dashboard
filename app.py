@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.26.0"
+APP_VERSION = "0.26.1"
 APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
@@ -2777,14 +2777,20 @@ def _pdf_industry_context_block(res, S):
     if res.get("_unparsed"):
         out += _pdf_markdown_flowables(res.get("raw", ""), S)
         return out
-    out.append(Paragraph(_pdf_mdclean(res.get("what_changed", "")), S["body"]))
+    for p in (res.get("what_changed") or "").split("\n"):
+        if p.strip():
+            out.append(Paragraph(_pdf_mdclean(p.strip()), S["body"]))
     trend, horizon = res.get("trend", ""), res.get("horizon", "")
     if trend or horizon:
         out.append(Paragraph(_pdf_mdclean(f"{trend} \u00b7 {horizon}"), S["note"]))
     if res.get("why_it_matters"):
         out.append(Paragraph(_pdf_mdclean("Why it matters: " + res["why_it_matters"]), S["body"]))
-    if res.get("what_to_watch"):
-        out.append(Paragraph(_pdf_mdclean("What to watch: " + res["what_to_watch"]), S["note"]))
+    watch_items = [ln.strip(" -\u2022\u2013\u2014") for ln in (res.get("what_to_watch") or "").split("\n")
+                  if ln.strip(" -\u2022\u2013\u2014")]
+    if watch_items:
+        out.append(Paragraph("WHAT TO WATCH", S["subg"]))
+        for item in watch_items:
+            out.append(Paragraph(_pdf_mdclean("\u2022 " + item), S["note"]))
     cites = res.get("citations") or []
     if cites:
         out.append(Paragraph(_pdf_mdclean("Sources: " + "; ".join(c.get("title", "") for c in cites[:6])), S["note"]))
@@ -5151,10 +5157,16 @@ Industry: {industry}
 Broader sector: {sector or industry}
 Run date: {run_date}
 
-Use web search to identify recent, material developments affecting companies broadly across this
-industry over the last 30\u201360 days \u2014 regulatory or policy changes, macroeconomic or commodity/input-cost
-trends, supply chain shifts, and notable competitive-landscape moves. Do NOT focus on any single company;
-this is about the industry as a whole, not one stock's news (that is covered elsewhere on this dashboard).
+Use web search to identify what is ACTUALLY driving companies in this space right now over the last
+30\u201360 days \u2014 regulatory or policy changes, macroeconomic or commodity/input-cost trends, supply chain
+shifts, and competitive-landscape moves. Do NOT focus on any single company; this is about the industry
+as a whole, not one stock's news (that is covered elsewhere on this dashboard).
+
+Be specific, not generic. If the labeled industry is broad (e.g. "Semiconductors") but the real driving
+dynamic is narrower (e.g. the memory cycle, foundry capacity, or equipment demand specifically), name that
+narrower dynamic explicitly and write about it \u2014 do not default to vague, could-apply-to-any-industry
+language like "facing headwinds and tailwinds." A reader should finish this knowing the one or two specific
+forces actually in play, not a generic summary that could describe half the market.
 
 Do NOT give buy/sell/hold advice, and do NOT recommend or name specific stocks to buy or avoid.
 
@@ -5170,23 +5182,28 @@ Tone rules:
 - Keep the tone neutral and research-oriented, never promotional.
 - Do not use words like "exponential," "unparalleled," "massive," "guaranteed," "historic," or "dominant"
   unless directly quoted from an official source.
-- Keep the text under 220 words.
+- Keep the total text under 400 words.
 - If there is no clear industry-wide development, say so clearly rather than inventing one.
 
 Return exactly the following, and nothing else \u2014 no source list, no preamble or closing remarks:
 
 PORTAL_TEXT_START
 ## WHAT'S HAPPENING IN {industry.upper() if industry else 'THIS INDUSTRY'}
-<2\u20134 sentences on the most notable recent industry-wide development(s)>
+<3\u20135 sentences naming the specific driving dynamic, why it's happening, and the key tension or
+open question around whether it's cyclical/temporary versus a more durable shift \u2014 not a generic
+overview>
 
 **Trend:** <Tailwind / Headwind / Mixed / Neutral>
 **Time horizon:** <Near-term / Multi-quarter / Structural>
 
 ### Why it matters for companies in this space
-<1\u20133 sentences>
+<2\u20134 sentences on how this could flow into revenue, margins, EPS, or cash flow for companies in this
+space, including the case for it reversing or normalizing>
 
 ### What to watch
-<one forward-looking thing worth verifying>
+<4\u20137 bullet points, each one concrete and specific to this industry's actual dynamics \u2014 not generic
+advice like "monitor market conditions." Include things like specific demand/pricing indicators, capacity
+or capex plans, inventory levels, regulatory triggers, or estimate-revision trends as relevant>
 PORTAL_TEXT_END
 """
 
@@ -5495,13 +5512,15 @@ def _render_industry_context_card(res, industry):
         st.markdown(res.get("raw", ""))
         return
     trend_color = {"Tailwind": POS, "Headwind": NEG}.get(res.get("trend"), MUTED)
+    paras = [p.strip() for p in (res.get("what_changed") or "").split("\n") if p.strip()]
+    body_html = "".join(f"<div style='font-size:.98rem;line-height:1.55;color:{INK};"
+                        f"font-style:italic;margin-top:.3rem' >{p}</div>" for p in paras)
     st.markdown(
         f"<div style='border:1px solid {LINE};border-radius:10px;padding:.9rem 1.1rem;"
         f"margin:.3rem 0 .5rem;max-width:52rem'>"
         f"<div style='letter-spacing:.09em;text-transform:uppercase;font-size:.6rem;color:{MUTED};"
         f"margin-bottom:.4rem'>What's happening in {industry}</div>"
-        f"<div style='font-size:.98rem;line-height:1.55;color:{INK};font-style:italic'>"
-        f"{res.get('what_changed', '')}</div>"
+        f"{body_html}"
         f"<div style='margin-top:.5rem;font-size:.85rem'>"
         f"<span style='color:{trend_color};font-weight:600'>{res.get('trend', '')}</span>"
         f"<span style='color:{MUTED}'> \u00b7 {res.get('horizon', '')}</span></div>"
@@ -5510,9 +5529,14 @@ def _render_industry_context_card(res, industry):
         st.markdown(f"<div style='font-size:.95rem;line-height:1.6;color:{INK};margin:.2rem 0;"
                     f"max-width:52rem'>Why it matters: {res['why_it_matters']}</div>",
                     unsafe_allow_html=True)
-    if res.get("what_to_watch"):
-        st.markdown(f"<div style='font-size:.85rem;color:{MUTED};margin-top:.3rem'>"
-                    f"What to watch: {res['what_to_watch']}</div>", unsafe_allow_html=True)
+    watch_items = [ln.strip(" -\u2022\u2013\u2014") for ln in (res.get("what_to_watch") or "").split("\n")
+                  if ln.strip(" -\u2022\u2013\u2014")]
+    if watch_items:
+        st.markdown(f"<div style='font-size:.78rem;letter-spacing:.06em;text-transform:uppercase;"
+                    f"color:{MUTED};margin-top:.5rem'>What to watch</div>", unsafe_allow_html=True)
+        for item in watch_items:
+            st.markdown(f"<div style='font-size:.85rem;color:{MUTED};margin:.15rem 0 .15rem .9rem'>"
+                        f"\u2022 {item}</div>", unsafe_allow_html=True)
     cites = res.get("citations") or []
     if cites:
         with st.expander("Sources reviewed", expanded=False):
