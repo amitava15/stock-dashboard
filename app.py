@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.26.1"
+APP_VERSION = "0.27.0"
 APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
@@ -2340,7 +2340,15 @@ def render_ai_analysis(symbol):
                "secrets — Haiku is about 3× cheaper than the default. You can also set a monthly "
                "spend cap in the Anthropic Console.")
     cache = st.session_state.setdefault("ai_analysis", {})
-    if st.button("✨ Generate AI analysis", key=f"ai_btn_{symbol}"):
+    bcol, rcol = st.columns([5, 0.5])
+    with bcol:
+        gen = st.button("✨ Generate AI analysis", key=f"ai_btn_{symbol}", use_container_width=True)
+    with rcol:
+        refresh = st.button("\U0001F504", key=f"ai_refresh_{symbol}", use_container_width=True,
+                            disabled=not cache.get(symbol),
+                            help="Regenerate — this call was never cached, so it's already fresh "
+                                 "every time; this is just a quick repeat of the button on the left")
+    if gen or refresh:
         with st.spinner("Claude is writing the full report…" if full else "Claude is reading the data…"):
             text, err = generate_ai_analysis(symbol, _analysis_json(symbol), full=full)
         if err:
@@ -5465,11 +5473,15 @@ def _render_saved_notes(symbol, name):
 def render_context(symbol, name):
     provider = _context_provider()
     _subgroup("Context \u2014 recent news & filings")
-    cc = st.columns([1.7, 1.7, 2.6])
+    cc = st.columns([1.7, 0.45, 1.7, 2.15])
     with cc[0]:
         gen = st.button("Generate latest context", key=f"ctx_{symbol}", use_container_width=True,
                         disabled=(provider is None))
     with cc[1]:
+        refresh = st.button("\U0001F504", key=f"ctxrefresh_{symbol}", use_container_width=True,
+                            disabled=(provider is None),
+                            help="Force a fresh pull, ignoring today's cached result")
+    with cc[2]:
         if st.button("AI Prompt for Offline Research", key=f"ctxp_{symbol}", use_container_width=True):
             _context_prompt_dialog(symbol, name)
 
@@ -5481,14 +5493,20 @@ def render_context(symbol, name):
         return
 
     cache_key = f"_ctx_cache_{symbol}"
-    if gen:
+    today = _dt.date.today().isoformat()
+    if gen or refresh:
         if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
             st.warning("That's a lot of context this session \u2014 pausing to protect your budget. "
                        "Reload to reset, or use AI Prompt for Offline Research instead.")
         else:
             st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+            if refresh:
+                # generate_context is @st.cache_data'd per (symbol, name, provider, day) —
+                # without busting that entry first, re-calling it just replays today's
+                # cached result instead of actually re-querying the provider.
+                generate_context.clear(symbol, name, provider, today)
             with st.spinner("Reading recent news and filings\u2026"):
-                res = generate_context(symbol, name, provider, _dt.date.today().isoformat())
+                res = generate_context(symbol, name, provider, today)
             st.session_state[cache_key] = res
 
     res = st.session_state.get(cache_key)
@@ -5555,10 +5573,33 @@ def render_industry_context(industry, sector):
     today = _dt.date.today().isoformat()
     with st.expander(f"Industry Context \u2014 {industry}", expanded=False):
         cached = get_industry_context(industry, today)
+        provider = _context_provider()
         if cached:
+            _, rcol = st.columns([6, 0.5])
+            with rcol:
+                refresh = st.button("\U0001F504", key=f"indctxrefresh_{slug}",
+                                    use_container_width=True, disabled=(provider is None),
+                                    help="Force a fresh pull for this industry, ignoring today's "
+                                         "shared cache \u2014 affects every stock in this industry, "
+                                         "not just this one")
+            if refresh:
+                if st.session_state.get("_ctx_calls", 0) >= CONTEXT_DAILY_SOFT_LIMIT:
+                    st.warning("That's a lot of context this session \u2014 pausing to protect your "
+                               "budget. Reload to reset.")
+                else:
+                    st.session_state["_ctx_calls"] = st.session_state.get("_ctx_calls", 0) + 1
+                    # Busts the session-level cache_data entry so the call below actually
+                    # re-queries the provider instead of replaying today's cached text, and
+                    # then overwrites the GitHub file every stock in this industry reads from.
+                    _industry_context_via_provider.clear(industry, sector, provider, today)
+                    with st.spinner(f"Reading recent {industry} developments\u2026"):
+                        fresh = _industry_context_via_provider(industry, sector, provider, today)
+                    if not fresh.get("error"):
+                        save_industry_context(industry, today, fresh)
+                    st.rerun()
+                return
             _render_industry_context_card(cached, industry)
             return
-        provider = _context_provider()
         st.caption(f"Recent regulatory, macro, and competitive developments across {industry} \u2014 "
                    "shared across every stock in this industry, refreshed once a day.")
         if provider is None:
