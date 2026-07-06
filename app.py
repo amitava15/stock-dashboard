@@ -25,7 +25,7 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.27.0"
+APP_VERSION = "0.27.1"
 APP_BUILD = "2026-07-05"
 
 # ---------------------------------------------------------------------------
@@ -5187,11 +5187,25 @@ Do not use low-quality blogs, broker marketing pages, promotional articles, SEO 
 generic stock-analysis summaries for material claims.
 
 Tone rules:
-- Keep the tone neutral and research-oriented, never promotional.
-- Do not use words like "exponential," "unparalleled," "massive," "guaranteed," "historic," or "dominant"
-  unless directly quoted from an official source.
+- Keep the tone neutral and research-oriented, never promotional or market-commentary-ish.
+- This is a research tool, not financial media \u2014 write like an analyst memo, not a headline.
+- Do not use dramatic or superlative language, including but not limited to: "unprecedented,"
+  "supercycle," "severe," "surge," "surging," "permanently reshape(s)," "exponential," "unparalleled,"
+  "massive," "dramatic," "stronger than ever," "severe shortage," "guaranteed," "dominant," "historic,"
+  "decouple," "explosive," "skyrocketing," "game-changing," "transformative." Use these only if directly
+  quoted from an official source, and put them in quotation marks if you do.
+- Prefer measured, hedged alternatives: "strengthened," "elevated," "notable," "meaningful," "improved,"
+  "may remain," "has increased," "remains uncertain" \u2014 not intensifiers.
+- Describe magnitude with numbers or ranges where possible, not adjectives.
 - Keep the total text under 400 words.
 - If there is no clear industry-wide development, say so clearly rather than inventing one.
+
+Before writing the final answer, silently verify:
+1. No word from the banned list above appears unquoted.
+2. Every claim of magnitude or trend is hedged appropriately (e.g. "may," "could," "remains uncertain")
+   rather than stated as a dramatic certainty.
+3. The text reads like a neutral research memo, not market commentary or a press release.
+4. The text is under 400 words and contains no buy/sell/hold advice.
 
 Return exactly the following, and nothing else \u2014 no source list, no preamble or closing remarks:
 
