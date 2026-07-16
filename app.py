@@ -25,8 +25,8 @@ st.set_page_config(page_title="Stock Research Dashboard", page_icon="📈", layo
 
 # App version — bump this on every change so you can confirm what's actually
 # deployed. It shows in the sidebar footer and the page footer.
-APP_VERSION = "0.27.1"
-APP_BUILD = "2026-07-05"
+APP_VERSION = "0.28.0"
+APP_BUILD = "2026-07-16"
 
 # ---------------------------------------------------------------------------
 # Styling: quiet editorial "tasting card" — serif values like menu prices,
@@ -275,28 +275,6 @@ def _fmp_get(path: str):
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     return resp.json()
-
-
-def _fmp_probe(path: str):
-    """Diagnostic fetch (uncached) — returns (rows, http_status, error) WITHOUT
-    swallowing, so the UI can surface exactly why an endpoint came back empty."""
-    sep = "&" if "?" in path else "?"
-    url = f"{FMP_BASE}/{path}{sep}apikey={FMP_KEY}"
-    try:
-        resp = requests.get(url, timeout=15)
-        status = resp.status_code
-        if status != 200:
-            try:
-                detail = str(resp.json())[:180]
-            except Exception:
-                detail = resp.text[:180]
-            return [], status, detail
-        data = resp.json()
-        if not isinstance(data, list):
-            return [], status, f"non-list: {str(data)[:180]}"
-        return data, status, ""
-    except Exception as e:  # noqa: BLE001
-        return [], None, str(e)[:180]
 
 
 MOVER_ENDPOINTS = {"gainers": "biggest-gainers", "losers": "biggest-losers", "actives": "most-actives"}
@@ -6393,6 +6371,144 @@ def _metrics_column(symbol):
     }
 
 
+# ===========================================================================
+# GROWTH DIVERGENCE — within an industry, who's leading on price and who
+# (among similarly large, established peers) has lagged that leader. A
+# growth-performance comparison, not a valuation screen — deliberately no
+# "cheap" / "bullish" / "opportunity" language anywhere below. Peer group is
+# the industry's largest names by market cap, with a manual override list
+# available per industry (curated comp sets, same idea as the peer sets used
+# for the industry benchmark elsewhere). Reuses the Compare page's rebased-%
+# chart machinery so chart and table are always built from the same numbers.
+# ===========================================================================
+
+DIVERGENCE_RANGE_DAYS = {"6M": 182, "1Y": 365, "3Y": 365 * 3, "5Y": 365 * 5}
+
+# Curated overrides win over the automatic market-cap ranking below — add an
+# entry here for any industry where the "biggest names" list should be hand-
+# picked rather than derived from the universe map.
+INDUSTRY_PEER_OVERRIDES = {
+    "Semiconductors": ["NVDA", "AMD", "INTC", "MU", "TXN"],
+}
+
+
+def industry_options():
+    """Sorted list of industries present in the universe map, for the picker."""
+    umap = get_universe_map()
+    inds = {d.get("industry") for d in umap.values() if d.get("industry")}
+    return sorted(inds)
+
+
+def _divergence_peer_group(industry, max_peers=5):
+    """Peer set for an industry: manual override if curated, else the
+    industry's largest names by market cap from the universe map."""
+    if industry in INDUSTRY_PEER_OVERRIDES:
+        return INDUSTRY_PEER_OVERRIDES[industry][:max_peers]
+    umap = get_universe_map()
+    cands = [(s, d.get("market_cap") or 0) for s, d in umap.items()
+             if d.get("industry") == industry]
+    cands.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in cands[:max_peers]]
+
+
+def _divergence_growth_table(symbols, days):
+    """Total % price return per symbol over `days`, from the same rebased
+    series the trend chart uses — so the table and chart always agree."""
+    out = {}
+    for s in symbols:
+        series = _rebased_series(s, days)
+        if series is not None and not series.empty:
+            out[s] = float(series["pct"].iloc[-1])
+    return out
+
+
+def _divergence_median_prices(symbol):
+    """Median close over the trailing 6M and 1Y, independent of whatever
+    window is selected for the growth comparison above."""
+    df = get_price_history(symbol)
+    if df.empty:
+        return None, None
+    cutoff_6m = df["date"].max() - pd.Timedelta(days=182)
+    cutoff_1y = df["date"].max() - pd.Timedelta(days=365)
+    med6 = df.loc[df["date"] >= cutoff_6m, "close"].median()
+    med1 = df.loc[df["date"] >= cutoff_1y, "close"].median()
+    return (med6 if pd.notna(med6) else None), (med1 if pd.notna(med1) else None)
+
+
+def render_growth_divergence():
+    section("Growth Divergence", "largest peers vs. the industry's own leader")
+    st.caption("Compares the largest companies in an industry against the group's own "
+               "price-performance leader over a selected window. This shows where the gap "
+               "sits — it isn't a ranking of quality, and it isn't a recommendation.")
+
+    industries = industry_options()
+    if not industries:
+        st.info("Industry data isn't available right now — try again in a bit.")
+        return
+
+    default_ind = "Semiconductors" if "Semiconductors" in industries else industries[0]
+    ccol1, ccol2 = st.columns([2, 1])
+    with ccol1:
+        industry = st.selectbox("Industry", industries,
+                                index=industries.index(default_ind), key="div_industry")
+    with ccol2:
+        window = st.selectbox("Window", list(DIVERGENCE_RANGE_DAYS.keys()),
+                              index=1, key="div_window")
+
+    peers = _divergence_peer_group(industry)
+    if len(peers) < 2:
+        st.info(f"Not enough peers found for **{industry}** to compare yet.")
+        return
+
+    umap = get_universe_map()
+    days = DIVERGENCE_RANGE_DAYS[window]
+
+    with st.spinner("Loading price history…"):
+        growth = _divergence_growth_table(peers, days)
+
+    if not growth:
+        st.warning("Couldn't load price history for this peer group on the current data plan.")
+        return
+
+    leader = max(growth, key=growth.get)
+    leader_val = growth[leader]
+
+    # ---- shared trend chart (reuses the Compare page's rebased-% chart) ----
+    with st.spinner("Building chart…"):
+        fig, missing = _comparison_chart(peers, days, include_spy=False)
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    if missing:
+        st.caption("Couldn't chart: " + ", ".join(f"**{m}**" for m in missing) +
+                   " — likely not covered on the current plan.")
+
+    # ---- table: growth, gap vs. leader, median prices ----
+    rows = []
+    for s in peers:
+        if s not in growth:
+            continue
+        g = growth[s]
+        gap = g - leader_val
+        med6, med1 = _divergence_median_prices(s)
+        d = umap.get(s, {})
+        rows.append({
+            "Company": f"{s}  ★ leader" if s == leader else s,
+            "Name": d.get("name") or s,
+            f"{window} growth": f"{g:+.1f}%",
+            "Gap vs. leader": "—" if s == leader else f"{gap:+.1f} pt",
+            "Median 6M": f"${med6:,.2f}" if med6 is not None else "—",
+            "Median 1Y": f"${med1:,.2f}" if med1 is not None else "—",
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows).set_index("Company"), use_container_width=True)
+
+    st.caption(f"**{leader}** led {industry.lower()} peers by price growth over "
+               f"{window} at {leader_val:+.1f}%. Gaps are percentage points behind the "
+               "leader, not a quality signal — check the company's own fundamentals "
+               "before reading a gap as anything more than a price fact. Median prices are "
+               "trailing 6M/1Y regardless of the window selected above.")
+
+
 def show_comparison():
     section("Compare", "side by side")
     st.caption("Build a set of 2–5 companies to see relative performance and fundamentals "
@@ -6509,6 +6625,10 @@ def _view_compare():
     st.session_state.view = {"kind": "compare"}
 
 
+def _view_divergence():
+    st.session_state.view = {"kind": "divergence"}
+
+
 def _view_top():
     st.session_state.view = {"kind": "top"}
 
@@ -6522,6 +6642,7 @@ def _view_tracker():
 view = st.session_state.get("view", {"kind": "top"})
 active_mover = view.get("mover") if view.get("kind") == "movers" else None
 on_compare = view.get("kind") == "compare"
+on_divergence = view.get("kind") == "divergence"
 
 # --- Daily starting point ---
 st.sidebar.button("\u2600\ufe0f  Top Stocks to Explore", use_container_width=True,
@@ -6576,6 +6697,13 @@ st.sidebar.button("Compare stocks  →", use_container_width=True,
                   type="primary" if on_compare else "secondary",
                   on_click=_view_compare)
 
+# --- Industry screens ---
+st.sidebar.markdown("---")
+st.sidebar.caption("Industry")
+st.sidebar.button("Growth Divergence  →", use_container_width=True,
+                  type="primary" if on_divergence else "secondary",
+                  on_click=_view_divergence)
+
 st.sidebar.markdown("---")
 st.sidebar.caption(f"📦 Version {APP_VERSION} · {APP_BUILD}")
 
@@ -6595,6 +6723,8 @@ if view.get("kind") == "stock":
     show_ticker(view["symbol"])
 elif view.get("kind") == "compare":
     show_comparison()
+elif view.get("kind") == "divergence":
+    render_growth_divergence()
 elif view.get("kind") == "tracker":
     render_tracker()
 elif view.get("kind") == "top":
